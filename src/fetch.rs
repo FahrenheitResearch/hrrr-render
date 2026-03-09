@@ -3,7 +3,7 @@
 /// HRRR data is on AWS S3 at `noaa-hrrr-bdp-pds` (no auth required).
 /// Each GRIB2 file has a `.idx` sidecar listing byte offsets per field.
 
-use chrono::{Utc, Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Utc, Duration};
 use std::io;
 
 const HRRR_BASE_URL: &str = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com";

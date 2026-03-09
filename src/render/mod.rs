@@ -14,7 +14,7 @@ pub mod projection;
 use color::{Color, background_color, border_color, text_color};
 use projection::LambertProjection;
 use rayon::prelude::*;
-use std::io::{self, Write, BufWriter};
+use std::io::{self, BufWriter};
 
 use crate::fields::FieldDef;
 
@@ -221,8 +221,8 @@ fn draw_borders(
 ) {
     let bc = border_color();
     let borders = state_borders();
-    let scale_x = data_width as f64 / proj.nx as f64;
-    let scale_y = height as f64 / proj.ny as f64;
+    let _scale_x = data_width as f64 / proj.nx as f64;
+    let _scale_y = height as f64 / proj.ny as f64;
 
     for polyline in &borders {
         for window in polyline.windows(2) {
@@ -288,7 +288,7 @@ fn draw_legend_labels(
     img_width: u32,
     height: u32,
     data_width: u32,
-    legend_width: u32,
+    _legend_width: u32,
     field: &FieldDef,
 ) {
     let tc = text_color();
@@ -349,7 +349,7 @@ fn draw_number(
 fn draw_title(
     pixels: &mut [Color],
     img_width: u32,
-    field: &FieldDef,
+    _field: &FieldDef,
 ) {
     // Draw a dark band at the top
     let band_height = 20u32;

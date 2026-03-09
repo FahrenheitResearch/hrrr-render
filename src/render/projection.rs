@@ -36,7 +36,7 @@ pub struct LambertProjection {
     // Derived constants
     n: f64,
     f_val: f64,
-    rho0: f64,
+    _rho0: f64,
     rho1: f64,
     theta1: f64,
 }
@@ -71,7 +71,7 @@ impl LambertProjection {
         };
 
         let f_val = (latin1.cos() * (PI / 4.0 + latin1 / 2.0).tan().powf(n)) / n;
-        let rho0 = EARTH_RADIUS * f_val; // rho at lat=90 would be 0 for n>0
+        let _rho0 = EARTH_RADIUS * f_val; // rho at lat=90 would be 0 for n>0
 
         // rho and theta for the first grid point
         let rho1 = EARTH_RADIUS * f_val / (PI / 4.0 + la1 / 2.0).tan().powf(n);
@@ -79,7 +79,7 @@ impl LambertProjection {
 
         LambertProjection {
             latin1, latin2, lov, la1, lo1, dx, dy, nx, ny,
-            n, f_val, rho0, rho1, theta1,
+            n, f_val, _rho0, rho1, theta1,
         }
     }
 
@@ -123,12 +123,16 @@ impl LambertProjection {
         let y = self.rho1 * self.theta1.cos() - j * self.dy;
 
         let rho = (x * x + y * y).sqrt() * self.n.signum();
-        let theta = y.atan2(x);
+        let theta = x.atan2(y); // atan2(x, y) for Lambert Conformal convention
 
         let lat = (2.0 * ((EARTH_RADIUS * self.f_val / rho).powf(1.0 / self.n)).atan()
             - PI / 2.0)
             * RAD_TO_DEG;
-        let lon = (self.lov + theta / self.n) * RAD_TO_DEG;
+        let mut lon = (self.lov + theta / self.n) * RAD_TO_DEG;
+
+        // Normalize longitude to [-180, 180]
+        while lon > 180.0 { lon -= 360.0; }
+        while lon < -180.0 { lon += 360.0; }
 
         (lat, lon)
     }

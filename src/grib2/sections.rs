@@ -1,7 +1,7 @@
 /// GRIB2 Section parsing (Sections 0 through 8).
 
 use byteorder::{BigEndian, ReadBytesExt};
-use std::io::{self, Cursor, Read};
+use std::io::{self, Cursor};
 
 use super::templates::LambertConformal;
 
