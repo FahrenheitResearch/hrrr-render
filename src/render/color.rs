@@ -358,6 +358,53 @@ pub fn angle_color(t: f64) -> Color {
     interpolate(stops, t)
 }
 
+/// STP color table: transparent at zero, ramps through yellow-orange-red-magenta
+pub fn stp_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0,   0,   0]),  // transparent (zero)
+        (0.02, [ 100, 100, 100, 255]),  // gray (trace)
+        (0.08, [ 180, 255, 180, 255]),  // pale green (0-1)
+        (0.17, [ 255, 255,   0, 255]),  // yellow (~2)
+        (0.33, [ 255, 180,   0, 255]),  // orange (~4)
+        (0.50, [ 255,  80,   0, 255]),  // dark orange (~6)
+        (0.67, [ 255,   0,   0, 255]),  // red (~8)
+        (0.83, [ 200,   0, 150, 255]),  // magenta (~10)
+        (1.00, [ 150,   0, 255, 255]),  // purple (~12)
+    ];
+    interpolate(stops, t)
+}
+
+/// SCP color table: similar ramp, broader range (0-20)
+pub fn scp_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0,   0,   0]),  // transparent
+        (0.02, [ 100, 100, 100, 255]),  // gray
+        (0.05, [ 150, 220, 150, 255]),  // pale green (~1)
+        (0.15, [ 255, 255,   0, 255]),  // yellow (~3)
+        (0.25, [ 255, 200,   0, 255]),  // gold (~5)
+        (0.40, [ 255, 130,   0, 255]),  // orange (~8)
+        (0.60, [ 255,   0,   0, 255]),  // red (~12)
+        (0.80, [ 200,   0, 150, 255]),  // magenta (~16)
+        (1.00, [ 150,   0, 255, 255]),  // purple (~20)
+    ];
+    interpolate(stops, t)
+}
+
+/// SHIP color table: 0-5 range
+pub fn ship_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0,   0,   0]),  // transparent
+        (0.04, [ 100, 100, 100, 255]),  // gray
+        (0.10, [ 150, 220, 150, 255]),  // pale green
+        (0.20, [ 255, 255,   0, 255]),  // yellow (~1)
+        (0.40, [ 255, 180,   0, 255]),  // orange (~2)
+        (0.60, [ 255,  50,   0, 255]),  // red-orange (~3)
+        (0.80, [ 255,   0,   0, 255]),  // red (~4)
+        (1.00, [ 200,   0, 200, 255]),  // magenta (~5)
+    ];
+    interpolate(stops, t)
+}
+
 /// Get the appropriate color function for a field name.
 pub fn color_for_field(field_name: &str) -> fn(f64) -> Color {
     match field_name {
@@ -386,6 +433,10 @@ pub fn color_for_field(field_name: &str) -> fn(f64) -> Color {
         "relv2km" | "relv1km" => vorticity_color,
         "cangle" => angle_color,
         "ustm" | "vstm" => vorticity_color,
+        "stp" => stp_color,
+        "scp" => scp_color,
+        "ship" => ship_color,
+        "shr01" | "shr06" | "ebs" => wind_color,
         _ => temperature_color,
     }
 }

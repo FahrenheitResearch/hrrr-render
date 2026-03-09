@@ -7,9 +7,58 @@ use super::projection::LambertProjection;
 
 static GEO_DATA: OnceLock<rustmaps::geo::GeoData> = OnceLock::new();
 
+/// Search for the Natural Earth geodata directory in common locations.
+fn find_geodata_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    // 1. HRRR_GEODATA env var
+    if let Ok(p) = std::env::var("HRRR_GEODATA") {
+        let pb = PathBuf::from(&p);
+        if pb.join("ne_10m_coastline.shp").exists() { return Some(pb); }
+    }
+
+    // 2. Next to the executable: <exe_dir>/data/
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("data");
+            if candidate.join("ne_10m_coastline.shp").exists() { return Some(candidate); }
+            // Also check one level up (for macOS .app bundles: Contents/MacOS/../Resources/data)
+            if let Some(parent) = dir.parent() {
+                let candidate = parent.join("Resources").join("data");
+                if candidate.join("ne_10m_coastline.shp").exists() { return Some(candidate); }
+                let candidate = parent.join("data");
+                if candidate.join("ne_10m_coastline.shp").exists() { return Some(candidate); }
+            }
+        }
+    }
+
+    // 3. Current working directory: ./data/
+    let cwd = PathBuf::from("data");
+    if cwd.join("ne_10m_coastline.shp").exists() { return Some(cwd); }
+
+    // 4. Home directory locations
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        // ~/rustmaps/data (dev layout)
+        let candidate = home.join("rustmaps").join("data");
+        if candidate.join("ne_10m_coastline.shp").exists() { return Some(candidate); }
+        // ~/.hrrr-render/data
+        let candidate = home.join(".hrrr-render").join("data");
+        if candidate.join("ne_10m_coastline.shp").exists() { return Some(candidate); }
+    }
+
+    None
+}
+
 fn get_geodata() -> &'static rustmaps::geo::GeoData {
     GEO_DATA.get_or_init(|| {
-        let data_dir = std::path::PathBuf::from(r"C:\Users\drew\rustmaps\data");
+        let data_dir = find_geodata_dir().unwrap_or_else(|| {
+            eprintln!("WARNING: Could not find Natural Earth geodata directory.");
+            eprintln!("  Set HRRR_GEODATA env var, or place data/ next to the executable.");
+            eprintln!("  Searched: <exe>/data/, ./data/, ~/rustmaps/data/, ~/.hrrr-render/data/");
+            // Fall back to a path that will fail gracefully with empty data
+            std::path::PathBuf::from("data")
+        });
         rustmaps::geo::GeoData::load(&data_dir).expect("Failed to load Natural Earth geodata")
     })
 }

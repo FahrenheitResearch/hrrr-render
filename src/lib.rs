@@ -1,5 +1,6 @@
 /// hrrr-render: The world's fastest HRRR weather map renderer.
 
+pub mod composite;
 pub mod fetch;
 pub mod fields;
 pub mod grib2;

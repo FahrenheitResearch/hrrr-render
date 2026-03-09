@@ -57,8 +57,9 @@ jobs:
         if: matrix.target == 'x86_64-apple-darwin'
         run: |
           mkdir -p "HRRR Viewer.app/Contents/MacOS"
-          mkdir -p "HRRR Viewer.app/Contents/Resources"
+          mkdir -p "HRRR Viewer.app/Contents/Resources/data"
           cp target/${{ matrix.target }}/release/hrrr-gui "HRRR Viewer.app/Contents/MacOS/"
+          cp data/*.shp data/*.shx data/*.dbf "HRRR Viewer.app/Contents/Resources/data/"
           cat > "HRRR Viewer.app/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -92,8 +93,9 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         run: |
           mkdir -p "HRRR Viewer.app/Contents/MacOS"
-          mkdir -p "HRRR Viewer.app/Contents/Resources"
+          mkdir -p "HRRR Viewer.app/Contents/Resources/data"
           cp target/${{ matrix.target }}/release/hrrr-gui "HRRR Viewer.app/Contents/MacOS/"
+          cp data/*.shp data/*.shx data/*.dbf "HRRR Viewer.app/Contents/Resources/data/"
           cat > "HRRR Viewer.app/Contents/Info.plist" << 'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -131,18 +133,20 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          mkdir -p staging
+          mkdir -p staging/data
           cp target/${{ matrix.target }}/release/hrrr-render${{ matrix.ext }} staging/
           cp target/${{ matrix.target }}/release/hrrr-gui${{ matrix.ext }} staging/
+          cp data/*.shp data/*.shx data/*.dbf staging/data/
           cd staging
           7z a ../${{ matrix.artifact }}.zip *
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          mkdir -p staging
+          mkdir -p staging/data
           cp target/${{ matrix.target }}/release/hrrr-render staging/ || true
           cp target/${{ matrix.target }}/release/hrrr-gui staging/ || true
+          cp data/*.shp data/*.shx data/*.dbf staging/data/
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
 

@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use hrrr_render::composite::{self, COMPOSITE_FIELDS};
 use hrrr_render::fields::{self, FIELDS, field_groups, fields_in_group};
 use hrrr_render::render::projection::LambertProjection;
 
@@ -81,6 +82,7 @@ struct HrrrApp {
 
     // UI state
     selected_field: usize,
+    selected_composite: Option<String>, // Some("stp") when a composite is active
     run_mode: String,
     run_options: Vec<(String, String)>,
     forecast_hour: u8,
@@ -99,11 +101,13 @@ struct HrrrApp {
     cached_nx: usize,
     cached_ny: usize,
     cached_field_idx: usize,
+    cached_field_unit: String,
     cached_img_width: u32,
 
     // Frame cache: keyed by forecast_hour, valid for current field+run
     frame_cache: HashMap<u8, CachedFrame>,
     cache_field_idx: usize,
+    cache_composite: Option<String>,
     cache_run_mode: String,
 
     // Animation
@@ -133,6 +137,7 @@ impl HrrrApp {
             texture: None,
             tex_size: [0, 0],
             selected_field: default_field,
+            selected_composite: None,
             run_mode: "latest".to_string(),
             run_options: available_runs(),
             forecast_hour: 0,
@@ -145,9 +150,11 @@ impl HrrrApp {
             cached_nx: 1799,
             cached_ny: 1059,
             cached_field_idx: default_field,
+            cached_field_unit: String::new(),
             cached_img_width: 1799 + 60,
             frame_cache: HashMap::new(),
             cache_field_idx: default_field,
+            cache_composite: None,
             cache_run_mode: "latest".to_string(),
             animating: false,
             anim_start: 0,
@@ -164,9 +171,13 @@ impl HrrrApp {
 
     /// Invalidate cache if field or run changed.
     fn check_cache_validity(&mut self) {
-        if self.cache_field_idx != self.selected_field || self.cache_run_mode != self.run_mode {
+        if self.cache_field_idx != self.selected_field
+            || self.cache_composite != self.selected_composite
+            || self.cache_run_mode != self.run_mode
+        {
             self.frame_cache.clear();
             self.cache_field_idx = self.selected_field;
+            self.cache_composite = self.selected_composite.clone();
             self.cache_run_mode = self.run_mode.clone();
         }
     }
@@ -190,9 +201,21 @@ impl HrrrApp {
             self.cached_img_width = cached.width;
             self.forecast_hour = fhour;
 
-            let field = &FIELDS[self.selected_field];
+            let label = if let Some(ref comp) = self.selected_composite {
+                let unit = COMPOSITE_FIELDS.iter()
+                    .find(|c| c.name == comp.as_str())
+                    .map(|c| c.unit).unwrap_or("");
+                self.cached_field_unit = unit.to_string();
+                COMPOSITE_FIELDS.iter()
+                    .find(|c| c.name == comp.as_str())
+                    .map(|c| c.label).unwrap_or(comp.as_str())
+            } else {
+                let field = &FIELDS[self.selected_field];
+                self.cached_field_unit = field.unit.to_string();
+                field.label
+            };
             let mut s = self.fetch_state.lock().unwrap();
-            s.status = format!("{} f{:02} (cached)", field.label, fhour);
+            s.status = format!("{} f{:02} (cached)", label, fhour);
             true
         } else {
             false
@@ -215,29 +238,56 @@ impl HrrrApp {
             s.status = "Fetching...".to_string();
         }
 
-        let field = FIELDS[self.selected_field].clone();
         let run = self.run_mode.clone();
         let fhour = self.forecast_hour;
         let width = self.render_width;
         let height = self.render_height;
         let ctx = ctx.clone();
+        let composite_name = self.selected_composite.clone();
 
-        std::thread::spawn(move || {
-            let result = fetch_and_render(&field, &run, fhour, width, height, &state, &ctx);
-            let mut s = state.lock().unwrap();
-            match result {
-                Ok((frame, date, run_hour, ms)) => {
-                    s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour });
-                    s.status = format!("{} | {} {:02}z f{:02} | {:.0}ms",
-                        field.label, date, run_hour, fhour, ms);
+        if let Some(comp_name) = composite_name {
+            // Composite field fetch
+            let comp_label = COMPOSITE_FIELDS.iter()
+                .find(|c| c.name == comp_name.as_str())
+                .map(|c| c.label).unwrap_or(&comp_name).to_string();
+
+            std::thread::spawn(move || {
+                let result = fetch_and_render_composite(
+                    &comp_name, &comp_label, &run, fhour, width, height, &state, &ctx,
+                );
+                let mut s = state.lock().unwrap();
+                match result {
+                    Ok((frame, date, run_hour, ms)) => {
+                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour });
+                        s.status = format!("{} | {} {:02}z f{:02} | {:.0}ms",
+                            comp_label, date, run_hour, fhour, ms);
+                    }
+                    Err(msg) => {
+                        s.status = msg;
+                    }
                 }
-                Err(msg) => {
-                    s.status = msg;
+                s.fetching = false;
+                ctx.request_repaint();
+            });
+        } else {
+            let field = FIELDS[self.selected_field].clone();
+            std::thread::spawn(move || {
+                let result = fetch_and_render(&field, &run, fhour, width, height, &state, &ctx);
+                let mut s = state.lock().unwrap();
+                match result {
+                    Ok((frame, date, run_hour, ms)) => {
+                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour });
+                        s.status = format!("{} | {} {:02}z f{:02} | {:.0}ms",
+                            field.label, date, run_hour, fhour, ms);
+                    }
+                    Err(msg) => {
+                        s.status = msg;
+                    }
                 }
-            }
-            s.fetching = false;
-            ctx.request_repaint();
-        });
+                s.fetching = false;
+                ctx.request_repaint();
+            });
+        }
     }
 
     fn start_fetch_hour(&mut self, fhour: u8, ctx: &egui::Context) {
@@ -259,21 +309,21 @@ impl HrrrApp {
             p.path = None;
         }
 
-        let field = FIELDS[self.selected_field].clone();
         let run = self.run_mode.clone();
         let start = self.anim_start;
         let end = self.anim_end;
         let width = self.render_width;
         let height = self.render_height;
         let speed_ms = self.anim_speed_ms;
-        // Clone cached frames we already have
         let existing_cache: HashMap<u8, CachedFrame> = self.frame_cache.clone();
         let ctx = ctx.clone();
+        let composite_name = self.selected_composite.clone();
+        let field = FIELDS[self.selected_field].clone();
 
         std::thread::spawn(move || {
             let result = do_gif_export(
-                &field, &run, start, end, width, height, speed_ms,
-                &existing_cache, &progress, &ctx,
+                &field, composite_name.as_deref(), &run, start, end,
+                width, height, speed_ms, &existing_cache, &progress, &ctx,
             );
             let mut p = progress.lock().unwrap();
             match result {
@@ -354,9 +404,92 @@ fn fetch_and_render(
     }, date, run_hour, render_ms))
 }
 
+/// Fetch and render a composite field (runs in background thread).
+fn fetch_and_render_composite(
+    comp_name: &str,
+    comp_label: &str,
+    run: &str,
+    fhour: u8,
+    width: u32,
+    height: u32,
+    state: &Arc<Mutex<FetchState>>,
+    ctx: &egui::Context,
+) -> Result<(CachedFrame, String, u8, f64), String> {
+    let t0 = Instant::now();
+
+    let (date, run_hour) = hrrr_render::fetch::parse_run(run)
+        .map_err(|e| format!("Error: {}", e))?;
+
+    {
+        let mut s = state.lock().unwrap();
+        s.status = format!("Computing {} f{:02}...", comp_label, fhour);
+    }
+    ctx.request_repaint();
+
+    let status_state = Arc::clone(state);
+    let status_ctx = ctx.clone();
+    let status_fn = move |msg: &str| {
+        if let Ok(mut s) = status_state.lock() {
+            s.status = msg.to_string();
+        }
+        status_ctx.request_repaint();
+    };
+
+    let (values, nx, ny) = composite::compute_composite(
+        comp_name, &date, run_hour, fhour, &status_fn,
+    ).map_err(|e| format!("Composite error: {}", e))?;
+
+    {
+        let mut s = state.lock().unwrap();
+        s.status = format!("Rendering {} f{:02}...", comp_label, fhour);
+    }
+    ctx.request_repaint();
+
+    // Find composite field def for color/range
+    let comp_def = COMPOSITE_FIELDS.iter()
+        .find(|c| c.name == comp_name)
+        .ok_or_else(|| format!("Unknown composite: {}", comp_name))?;
+
+    // Build a temporary FieldDef for rendering
+    let tmp_field = hrrr_render::fields::FieldDef {
+        name: comp_def.name,
+        label: comp_def.label,
+        unit: comp_def.unit,
+        discipline: 0,
+        category: 0,
+        number: 0,
+        idx_name: "",
+        level: "",
+        value_range: comp_def.value_range,
+        kelvin_to_fahrenheit: false,
+        group: comp_def.group,
+    };
+
+    let proj = LambertProjection::new(
+        38.5, 38.5, -97.5, 21.138, -122.72,
+        3000.0, 3000.0, nx as u32, ny as u32,
+    );
+
+    let (pixel_buf, img_width, img_height) =
+        hrrr_render::render::render_to_pixels(&values, &tmp_field, &proj, width, height);
+
+    let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let flat: Vec<u8> = pixel_buf.iter().flat_map(|c| c.iter().copied()).collect();
+
+    Ok((CachedFrame {
+        pixels: flat,
+        width: img_width,
+        height: img_height,
+        values,
+        nx,
+        ny,
+    }, date, run_hour, render_ms))
+}
+
 /// Export animation frames to GIF.
 fn do_gif_export(
     field: &hrrr_render::fields::FieldDef,
+    composite_name: Option<&str>,
     run: &str,
     start: u8,
     end: u8,
@@ -369,7 +502,8 @@ fn do_gif_export(
 ) -> Result<String, String> {
     use std::fs::File;
 
-    let path = format!("hrrr_{}_{}.gif", field.name,
+    let gif_name = composite_name.unwrap_or(field.name);
+    let path = format!("hrrr_{}_{}.gif", gif_name,
         chrono::Utc::now().format("%Y%m%d_%H%M%S"));
 
     // Collect all frames
@@ -389,6 +523,14 @@ fn do_gif_export(
 
         let frame = if let Some(cached) = existing_cache.get(&fhour) {
             cached.clone()
+        } else if let Some(comp) = composite_name {
+            let comp_label = COMPOSITE_FIELDS.iter()
+                .find(|c| c.name == comp)
+                .map(|c| c.label).unwrap_or(comp);
+            let (frame, _, _, _) = fetch_and_render_composite(
+                comp, comp_label, run, fhour, width, height, &dummy_state, ctx,
+            )?;
+            frame
         } else {
             let (frame, _, _, _) = fetch_and_render(
                 field, run, fhour, width, height, &dummy_state, ctx,
@@ -467,6 +609,14 @@ impl eframe::App for HrrrApp {
                 self.cached_nx = frame.nx;
                 self.cached_ny = frame.ny;
                 self.cached_field_idx = self.selected_field;
+                self.cached_field_unit = if let Some(ref comp) = self.selected_composite {
+                    COMPOSITE_FIELDS.iter()
+                        .find(|c| c.name == comp.as_str())
+                        .map(|c| c.unit.to_string())
+                        .unwrap_or_default()
+                } else {
+                    FIELDS[self.selected_field].unit.to_string()
+                };
                 self.cached_img_width = frame.width;
 
                 // Store in cache
@@ -529,7 +679,8 @@ impl eframe::App for HrrrApp {
 
                         for field in fields_in_group(group) {
                             let idx = FIELDS.iter().position(|f| f.name == field.name).unwrap();
-                            let is_active = self.selected_field == idx;
+                            let is_active = self.selected_composite.is_none()
+                                && self.selected_field == idx;
                             let text = if is_active {
                                 egui::RichText::new(field.label)
                                     .color(egui::Color32::BLACK).strong().size(11.0)
@@ -548,11 +699,51 @@ impl eframe::App for HrrrApp {
                             if response.clicked() && !fetching {
                                 self.animating = false;
                                 self.selected_field = idx;
+                                self.selected_composite = None;
                                 self.start_fetch(ctx);
                             }
                             if response.hovered() && !is_active {
                                 response.on_hover_text(format!("{} ({})", field.label, field.unit));
                             }
+                        }
+                    }
+
+                    // Composite (Tornado) fields
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Tornado")
+                        .color(egui::Color32::from_rgb(0xA0, 0xA0, 0xB0))
+                        .strong().size(11.0));
+                    ui.add_space(2.0);
+
+                    for comp in COMPOSITE_FIELDS.iter() {
+                        let is_active = self.selected_composite.as_deref() == Some(comp.name);
+                        let text = if is_active {
+                            egui::RichText::new(comp.label)
+                                .color(egui::Color32::BLACK).strong().size(11.0)
+                        } else {
+                            egui::RichText::new(comp.label)
+                                .color(egui::Color32::from_rgb(0xC0, 0xC0, 0xD0)).size(11.0)
+                        };
+
+                        let btn = egui::Button::new(text)
+                            .corner_radius(egui::CornerRadius::same(3))
+                            .min_size(egui::vec2(ui.available_width(), 20.0));
+                        let btn = if is_active { btn.fill(accent) }
+                            else { btn.fill(egui::Color32::TRANSPARENT) };
+
+                        let response = ui.add(btn);
+                        if response.clicked() && !fetching {
+                            self.animating = false;
+                            self.selected_composite = Some(comp.name.to_string());
+                            self.start_fetch(ctx);
+                        }
+                        if response.hovered() && !is_active {
+                            let hover = if comp.unit.is_empty() {
+                                comp.label.to_string()
+                            } else {
+                                format!("{} ({})", comp.label, comp.unit)
+                            };
+                            response.on_hover_text(hover);
                         }
                     }
                 });
@@ -794,8 +985,12 @@ impl eframe::App for HrrrApp {
                                     if i < self.cached_nx && j < self.cached_ny {
                                         let idx = j * self.cached_nx + i;
                                         if idx < vals.len() && !vals[idx].is_nan() {
-                                            let field = &FIELDS[self.cached_field_idx];
-                                            format!("{:.1} {}", vals[idx], field.unit)
+                                            let unit = if !self.cached_field_unit.is_empty() {
+                                                &self.cached_field_unit
+                                            } else {
+                                                FIELDS[self.cached_field_idx].unit
+                                            };
+                                            format!("{:.1} {}", vals[idx], unit)
                                         } else { "N/A".into() }
                                     } else { String::new() }
                                 } else { String::new() };
