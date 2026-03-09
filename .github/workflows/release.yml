@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: hrrr-render-windows-x86_64
+            ext: .exe
+          - target: x86_64-apple-darwin
+            os: macos-14
+            artifact: hrrr-render-macos-x86_64
+            ext: ""
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: hrrr-render-macos-aarch64
+            ext: ""
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: hrrr-render-linux-x86_64
+            ext: ""
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.target }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Codesign (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force -s - target/${{ matrix.target }}/release/hrrr-render
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/hrrr-render${{ matrix.ext }} staging/
+          cd staging
+          7z a ../${{ matrix.artifact }}.zip *
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/hrrr-render staging/
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    name: Create Release
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -R artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          body: |
+            ## hrrr-render ${{ github.ref_name }}
+
+            High-performance HRRR (High-Resolution Rapid Refresh) weather map renderer.
+
+            Renders GRIB2 data to PNG maps with geographic projections, colortables, and shapefile overlays.
+
+            ### Downloads
+            - **Windows** (x86_64): `.zip`
+            - **macOS Intel** (x86_64): `.tar.gz`
+            - **macOS Apple Silicon** (aarch64): `.tar.gz`
+            - **Linux** (x86_64): `.tar.gz`
+          generate_release_notes: true

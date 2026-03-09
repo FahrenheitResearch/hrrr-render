@@ -14,6 +14,7 @@ grib = { version = "0.13", default-features = false }
 png = "0.17"
 rayon = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
+rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git" }
 
 [profile.release]
 opt-level = 3
