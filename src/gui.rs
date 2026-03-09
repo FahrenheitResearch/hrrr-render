@@ -43,6 +43,7 @@ struct CachedFrame {
 struct IncomingFrame {
     frame: CachedFrame,
     forecast_hour: u8,
+    field_key: String,
 }
 
 /// Shared state between UI and background fetch thread.
@@ -104,10 +105,8 @@ struct HrrrApp {
     cached_field_unit: String,
     cached_img_width: u32,
 
-    // Frame cache: keyed by forecast_hour, valid for current field+run
-    frame_cache: HashMap<u8, CachedFrame>,
-    cache_field_idx: usize,
-    cache_composite: Option<String>,
+    // Frame cache: keyed by (field_key, forecast_hour), cleared on run change
+    frame_cache: HashMap<(String, u8), CachedFrame>,
     cache_run_mode: String,
 
     // Animation
@@ -153,8 +152,6 @@ impl HrrrApp {
             cached_field_unit: String::new(),
             cached_img_width: 1799 + 60,
             frame_cache: HashMap::new(),
-            cache_field_idx: default_field,
-            cache_composite: None,
             cache_run_mode: "latest".to_string(),
             animating: false,
             anim_start: 0,
@@ -169,15 +166,19 @@ impl HrrrApp {
         }
     }
 
-    /// Invalidate cache if field or run changed.
+    /// Get the cache key prefix for the current field selection.
+    fn current_field_key(&self) -> String {
+        if let Some(ref comp) = self.selected_composite {
+            comp.clone()
+        } else {
+            FIELDS[self.selected_field].name.to_string()
+        }
+    }
+
+    /// Invalidate cache if run changed.
     fn check_cache_validity(&mut self) {
-        if self.cache_field_idx != self.selected_field
-            || self.cache_composite != self.selected_composite
-            || self.cache_run_mode != self.run_mode
-        {
+        if self.cache_run_mode != self.run_mode {
             self.frame_cache.clear();
-            self.cache_field_idx = self.selected_field;
-            self.cache_composite = self.selected_composite.clone();
             self.cache_run_mode = self.run_mode.clone();
         }
     }
@@ -185,7 +186,8 @@ impl HrrrApp {
     /// Try to load a frame from cache. Returns true if found.
     fn load_from_cache(&mut self, fhour: u8, ctx: &egui::Context) -> bool {
         self.check_cache_validity();
-        if let Some(cached) = self.frame_cache.get(&fhour) {
+        let key = (self.current_field_key(), fhour);
+        if let Some(cached) = self.frame_cache.get(&key) {
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [cached.width as usize, cached.height as usize],
                 &cached.pixels,
@@ -244,6 +246,7 @@ impl HrrrApp {
         let height = self.render_height;
         let ctx = ctx.clone();
         let composite_name = self.selected_composite.clone();
+        let field_key = self.current_field_key();
 
         if let Some(comp_name) = composite_name {
             // Composite field fetch
@@ -258,7 +261,7 @@ impl HrrrApp {
                 let mut s = state.lock().unwrap();
                 match result {
                     Ok((frame, date, run_hour, ms)) => {
-                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour });
+                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour, field_key });
                         s.status = format!("{} | {} {:02}z f{:02} | {:.0}ms",
                             comp_label, date, run_hour, fhour, ms);
                     }
@@ -276,7 +279,7 @@ impl HrrrApp {
                 let mut s = state.lock().unwrap();
                 match result {
                     Ok((frame, date, run_hour, ms)) => {
-                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour });
+                        s.incoming = Some(IncomingFrame { frame, forecast_hour: fhour, field_key });
                         s.status = format!("{} | {} {:02}z f{:02} | {:.0}ms",
                             field.label, date, run_hour, fhour, ms);
                     }
@@ -315,7 +318,12 @@ impl HrrrApp {
         let width = self.render_width;
         let height = self.render_height;
         let speed_ms = self.anim_speed_ms;
-        let existing_cache: HashMap<u8, CachedFrame> = self.frame_cache.clone();
+        let field_key = self.current_field_key();
+        // Extract frames for this field from the cache
+        let existing_cache: HashMap<u8, CachedFrame> = self.frame_cache.iter()
+            .filter(|((k, _), _)| k == &field_key)
+            .map(|((_, fh), frame)| (*fh, frame.clone()))
+            .collect();
         let ctx = ctx.clone();
         let composite_name = self.selected_composite.clone();
         let field = FIELDS[self.selected_field].clone();
@@ -620,7 +628,8 @@ impl eframe::App for HrrrApp {
                 self.cached_img_width = frame.width;
 
                 // Store in cache
-                self.frame_cache.insert(fhour, frame);
+                let cache_key = (incoming.field_key, fhour);
+                self.frame_cache.insert(cache_key, frame);
             }
         }
 
@@ -927,20 +936,21 @@ impl eframe::App for HrrrApp {
                     self.pan += response.drag_delta();
                 }
 
+                // Only zoom when pointer is hovering over the map image, not sidebar scroll
                 let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll != 0.0 {
-                    let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                if scroll.abs() > 3.0 {
                     if let Some(pointer) = ui.input(|i| i.pointer.hover_pos()) {
-                        let center = rect.center();
-                        let before = egui::vec2(
-                            pointer.x - center.x - self.pan.x,
-                            pointer.y - center.y - self.pan.y,
-                        );
-                        self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
-                        let after = before * factor;
-                        self.pan += before - after;
-                    } else {
-                        self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
+                        if rect.contains(pointer) {
+                            let factor = if scroll > 0.0 { 1.05 } else { 1.0 / 1.05 };
+                            let center = rect.center();
+                            let before = egui::vec2(
+                                pointer.x - center.x - self.pan.x,
+                                pointer.y - center.y - self.pan.y,
+                            );
+                            self.zoom = (self.zoom * factor).clamp(0.25, 4.0);
+                            let after = before * factor;
+                            self.pan += before - after;
+                        }
                     }
                 }
 
@@ -985,12 +995,7 @@ impl eframe::App for HrrrApp {
                                     if i < self.cached_nx && j < self.cached_ny {
                                         let idx = j * self.cached_nx + i;
                                         if idx < vals.len() && !vals[idx].is_nan() {
-                                            let unit = if !self.cached_field_unit.is_empty() {
-                                                &self.cached_field_unit
-                                            } else {
-                                                FIELDS[self.cached_field_idx].unit
-                                            };
-                                            format!("{:.1} {}", vals[idx], unit)
+                                            format!("{:.1} {}", vals[idx], &self.cached_field_unit)
                                         } else { "N/A".into() }
                                     } else { String::new() }
                                 } else { String::new() };
