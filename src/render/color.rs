@@ -210,17 +210,182 @@ pub fn height_color(t: f64) -> Color {
     interpolate(stops, t)
 }
 
+/// CIN color table: green (weak inhibition) to blue-purple (strong cap)
+pub fn cin_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [ 150,   0, 200, 255]),  // purple (strong cap, most negative)
+        (0.15, [  80,   0, 180, 255]),
+        (0.30, [   0,  50, 200, 255]),  // blue
+        (0.50, [   0, 130, 200, 255]),  // light blue
+        (0.70, [   0, 180, 150, 255]),  // teal
+        (0.85, [ 100, 220, 100, 255]),  // green (weak cap)
+        (1.00, [ 200, 255, 200, 255]),  // pale green (no cap)
+    ];
+    interpolate(stops, t)
+}
+
+/// SRH/Helicity color table: blue (negative) through warm (positive)
+pub fn helicity_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0, 150, 255]),  // blue (anticyclonic)
+        (0.15, [   0, 100, 200, 255]),
+        (0.30, [ 200, 200, 200, 255]),  // gray (near zero)
+        (0.40, [ 255, 255, 150, 255]),  // pale yellow
+        (0.50, [ 255, 255,   0, 255]),  // yellow
+        (0.60, [ 255, 200,   0, 255]),  // gold
+        (0.70, [ 255, 130,   0, 255]),  // orange
+        (0.80, [ 255,  50,   0, 255]),  // red
+        (0.90, [ 200,   0, 100, 255]),  // magenta
+        (1.00, [ 150,   0, 200, 255]),  // purple (extreme)
+    ];
+    interpolate(stops, t)
+}
+
+/// Updraft helicity color table: transparent for low, hot for high
+pub fn updraft_helicity_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0,   0,   0]),  // transparent
+        (0.05, [ 100, 100, 100, 255]),  // gray
+        (0.15, [   0, 200, 200, 255]),  // cyan
+        (0.25, [   0, 255,   0, 255]),  // green
+        (0.40, [ 255, 255,   0, 255]),  // yellow
+        (0.55, [ 255, 130,   0, 255]),  // orange
+        (0.70, [ 255,   0,   0, 255]),  // red
+        (0.85, [ 200,   0, 200, 255]),  // magenta
+        (1.00, [ 255, 255, 255, 255]),  // white (extreme)
+    ];
+    interpolate(stops, t)
+}
+
+/// Moisture / PWAT color table: brown-green-blue
+pub fn moisture_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [ 140,  80,  20, 255]),  // brown (very dry)
+        (0.20, [ 200, 180, 100, 255]),  // tan
+        (0.35, [ 100, 200, 100, 255]),  // green
+        (0.50, [   0, 180, 130, 255]),  // teal
+        (0.65, [   0, 130, 200, 255]),  // blue
+        (0.80, [   0,  80, 200, 255]),  // dark blue
+        (0.90, [ 100,   0, 200, 255]),  // purple
+        (1.00, [ 200, 100, 255, 255]),  // violet (tropical)
+    ];
+    interpolate(stops, t)
+}
+
+/// Hail size color table
+pub fn hail_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0,   0,   0]),  // transparent (no hail)
+        (0.05, [ 100, 200, 100, 255]),  // green (small)
+        (0.20, [ 255, 255,   0, 255]),  // yellow (1")
+        (0.40, [ 255, 150,   0, 255]),  // orange (significant)
+        (0.60, [ 255,   0,   0, 255]),  // red (severe)
+        (0.80, [ 200,   0, 200, 255]),  // magenta (giant)
+        (1.00, [ 255, 255, 255, 255]),  // white (extreme)
+    ];
+    interpolate(stops, t)
+}
+
+/// Lifted index color table: reversed (negative = unstable = warm colors)
+pub fn lifted_index_color(t: f64) -> Color {
+    // t=0 is most negative (very unstable), t=1 is most positive (stable)
+    let stops: &[ColorStop] = &[
+        (0.00, [ 150,   0, 200, 255]),  // purple (extremely unstable)
+        (0.10, [ 255,   0,   0, 255]),  // red
+        (0.20, [ 255, 130,   0, 255]),  // orange
+        (0.35, [ 255, 255,   0, 255]),  // yellow
+        (0.50, [ 200, 200, 200, 255]),  // gray (neutral)
+        (0.65, [ 100, 200, 255, 255]),  // light blue
+        (0.80, [   0, 100, 200, 255]),  // blue
+        (1.00, [   0,   0, 150, 255]),  // dark blue (stable)
+    ];
+    interpolate(stops, t)
+}
+
+/// Vorticity color table: blue (negative/anticyclonic) - red (positive/cyclonic)
+pub fn vorticity_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0, 200, 255]),  // blue (strong anticyclonic)
+        (0.30, [   0, 150, 255, 255]),  // light blue
+        (0.45, [ 200, 200, 200, 255]),  // gray
+        (0.55, [ 200, 200, 200, 255]),  // gray
+        (0.70, [ 255, 150,   0, 255]),  // orange
+        (0.85, [ 255,   0,   0, 255]),  // red
+        (1.00, [ 200,   0, 100, 255]),  // magenta (strong cyclonic)
+    ];
+    interpolate(stops, t)
+}
+
+/// Cloud cover / percentage color table
+pub fn percentage_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [  20,  25,  35, 255]),  // dark (clear)
+        (0.20, [  50,  60,  80, 255]),
+        (0.40, [ 100, 110, 130, 255]),
+        (0.60, [ 150, 160, 170, 255]),
+        (0.80, [ 200, 210, 215, 255]),
+        (1.00, [ 240, 245, 250, 255]),  // white (overcast)
+    ];
+    interpolate(stops, t)
+}
+
+/// MSLP / pressure color table
+pub fn pressure_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [ 200,   0, 200, 255]),  // magenta (deep low)
+        (0.15, [ 100,   0, 200, 255]),  // purple
+        (0.30, [   0, 100, 255, 255]),  // blue
+        (0.45, [   0, 200, 200, 255]),  // cyan
+        (0.55, [ 100, 230, 100, 255]),  // green
+        (0.70, [ 255, 255,   0, 255]),  // yellow
+        (0.85, [ 255, 150,   0, 255]),  // orange
+        (1.00, [ 255,   0,   0, 255]),  // red (strong high)
+    ];
+    interpolate(stops, t)
+}
+
+/// Angle color table (0-180 for critical angle)
+pub fn angle_color(t: f64) -> Color {
+    let stops: &[ColorStop] = &[
+        (0.00, [   0,   0, 150, 255]),  // blue (small angle)
+        (0.25, [   0, 150, 200, 255]),  // cyan
+        (0.40, [ 100, 230, 100, 255]),  // green
+        (0.50, [ 255, 255,   0, 255]),  // yellow (90 degrees - perpendicular)
+        (0.60, [ 255, 200,   0, 255]),  // gold
+        (0.75, [ 255, 100,   0, 255]),  // orange
+        (1.00, [ 255,   0,   0, 255]),  // red (large angle)
+    ];
+    interpolate(stops, t)
+}
+
 /// Get the appropriate color function for a field name.
 pub fn color_for_field(field_name: &str) -> fn(f64) -> Color {
     match field_name {
-        "temp2m" => temperature_color,
-        "dewp2m" => dewpoint_color,
-        "ref" => reflectivity_color,
-        "cape" => cape_color,
-        "wind10m" => wind_color,
+        "temp2m" | "sfct" => temperature_color,
+        "dewp2m" | "td850" => dewpoint_color,
+        "ref" | "ref1km" | "ref4km" | "maxref" => reflectivity_color,
+        "sbcape" | "mlcape" | "mucape" | "cape03" => cape_color,
+        "sbcin" | "mlcin" | "mucin" => cin_color,
+        "wind10m" | "gust" | "wind250" | "wind80m" => wind_color,
         "vis" => visibility_color,
-        "precip" => precip_color,
-        "h500" => height_color,
+        "precip" | "apcp" => precip_color,
+        "h500" | "h700" | "h850" => height_color,
+        "t500" | "t700" | "t850" => temperature_color,
+        "srh3km" | "srh1km" | "efhl" => helicity_color,
+        "uh25" | "uh02" | "uh03" => updraft_helicity_color,
+        "mnuh02" => cin_color,  // negative values, similar scale
+        "maxuvv" | "maxdvv" => wind_color,
+        "lftx" | "4lftx" => lifted_index_color,
+        "hail" | "hailsfc" | "graupel" => hail_color,
+        "retop" | "vil" => cape_color,
+        "pwat" => moisture_color,
+        "rh2m" | "tcc" | "cpofp" => percentage_color,
+        "mslp" => pressure_color,
+        "pblh" | "lcl" | "lfc" | "el" | "ceil" | "fzlev" | "esp" => cape_color,
+        "ltng" => updraft_helicity_color,
+        "relv2km" | "relv1km" => vorticity_color,
+        "cangle" => angle_color,
+        "ustm" | "vstm" => vorticity_color,
         _ => temperature_color,
     }
 }

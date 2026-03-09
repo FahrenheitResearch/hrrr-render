@@ -1,6 +1,6 @@
 [package]
 name = "hrrr-render"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "The world's fastest HRRR weather map renderer"
 license = "MIT"
@@ -9,12 +9,29 @@ license = "MIT"
 byteorder = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+eframe = { version = "0.31", features = ["wgpu"], optional = true }
+egui = { version = "0.31", optional = true }
+gif = { version = "0.13", optional = true }
 flate2 = "1"
 grib = { version = "0.13", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 png = "0.17"
 rayon = "1"
 reqwest = { version = "0.12", features = ["blocking"] }
 rustmaps = { git = "https://github.com/FahrenheitResearch/rustmaps.git" }
+
+[features]
+default = ["gui"]
+gui = ["eframe", "egui", "image", "gif"]
+
+[[bin]]
+name = "hrrr-render"
+path = "src/main.rs"
+
+[[bin]]
+name = "hrrr-gui"
+path = "src/gui.rs"
+required-features = ["gui"]
 
 [profile.release]
 opt-level = 3

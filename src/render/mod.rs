@@ -192,6 +192,93 @@ fn draw_title(
     }
 }
 
+/// Render weather data to a raw RGBA pixel buffer (no PNG encoding).
+/// Returns (pixels, total_width, height) where total_width includes the legend bar.
+pub fn render_to_pixels(
+    values: &[f64],
+    field: &FieldDef,
+    proj: &LambertProjection,
+    width: u32,
+    height: u32,
+) -> (Vec<[u8; 4]>, u32, u32) {
+    let nx = proj.nx as usize;
+    let ny = proj.ny as usize;
+
+    let color_fn = color::color_for_field(field.name);
+    let (vmin, vmax) = field.value_range;
+
+    let scale_x = nx as f64 / width as f64;
+    let scale_y = ny as f64 / height as f64;
+
+    let contour_mask = if field.name == "h500" {
+        Some(contour::height_contour_mask(values, nx, ny))
+    } else {
+        None
+    };
+
+    let legend_width = 60u32;
+    let img_width = width + legend_width;
+
+    // 1. Draw base map
+    let mut pixel_buf = vec![[20u8, 20, 30, 255]; (img_width * height) as usize];
+    mapbase::draw_base_map(&mut pixel_buf, img_width, height, proj, width);
+
+    // 2. Overlay weather data
+    let is_transparent_field = matches!(field.name, "ref" | "precip");
+
+    for row in 0..height {
+        for col in 0..width {
+            let gi = col as f64 * scale_x;
+            let gj = (height - 1 - row) as f64 * scale_y;
+
+            let i = gi.round() as isize;
+            let j = gj.round() as isize;
+
+            if i < 0 || i >= nx as isize || j < 0 || j >= ny as isize { continue; }
+
+            let idx = j as usize * nx + i as usize;
+            if idx >= values.len() { continue; }
+            let val = values[idx];
+            if val.is_nan() { continue; }
+
+            let c = if let Some(ref cm) = contour_mask {
+                if cm[idx] {
+                    let base = color_fn(color::normalize(val, vmin, vmax));
+                    [(base[0] as f64 * 0.5) as u8, (base[1] as f64 * 0.5) as u8, (base[2] as f64 * 0.5) as u8, 255]
+                } else {
+                    color_fn(color::normalize(val, vmin, vmax))
+                }
+            } else {
+                color_fn(color::normalize(val, vmin, vmax))
+            };
+
+            if is_transparent_field && c[3] == 0 { continue; }
+
+            let pidx = (row * img_width + col) as usize;
+            if pidx < pixel_buf.len() {
+                pixel_buf[pidx] = c;
+            }
+        }
+
+        // Legend bar
+        let t = 1.0 - (row as f64 / height as f64);
+        let legend_color = color_fn(t);
+        for lx in 0..legend_width {
+            let pidx = (row * img_width + width + lx) as usize;
+            if pidx < pixel_buf.len() {
+                pixel_buf[pidx] = legend_color;
+            }
+        }
+    }
+
+    // 3. Overlay features
+    mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, width);
+    draw_legend_labels(&mut pixel_buf, img_width, height, width, legend_width, field);
+    draw_title(&mut pixel_buf, img_width, field);
+
+    (pixel_buf, img_width, height)
+}
+
 /// Encode RGBA pixel data to PNG bytes.
 fn encode_png(pixels: &[Color], width: u32, height: u32) -> io::Result<Vec<u8>> {
     let mut png_data = Vec::new();

@@ -44,12 +44,88 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Codesign (macOS)
+      - name: Create macOS App Bundle (Intel)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          mkdir -p "HRRR Viewer.app/Contents/MacOS"
+          mkdir -p "HRRR Viewer.app/Contents/Resources"
+          cp target/${{ matrix.target }}/release/hrrr-gui "HRRR Viewer.app/Contents/MacOS/"
+          cat > "HRRR Viewer.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>HRRR Viewer</string>
+            <key>CFBundleDisplayName</key>
+            <string>HRRR Viewer</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fahrenheitresearch.hrrr-viewer</string>
+            <key>CFBundleVersion</key>
+            <string>0.2.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.2.0</string>
+            <key>CFBundleExecutable</key>
+            <string>hrrr-gui</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.15</string>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep -s - "HRRR Viewer.app"
+          hdiutil create -volname "HRRR Viewer" -srcfolder "HRRR Viewer.app" -ov -format UDZO HRRRViewer-macOS-Intel.dmg
+
+      - name: Create macOS App Bundle (Apple Silicon)
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          mkdir -p "HRRR Viewer.app/Contents/MacOS"
+          mkdir -p "HRRR Viewer.app/Contents/Resources"
+          cp target/${{ matrix.target }}/release/hrrr-gui "HRRR Viewer.app/Contents/MacOS/"
+          cat > "HRRR Viewer.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>HRRR Viewer</string>
+            <key>CFBundleDisplayName</key>
+            <string>HRRR Viewer</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.fahrenheitresearch.hrrr-viewer</string>
+            <key>CFBundleVersion</key>
+            <string>0.2.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>0.2.0</string>
+            <key>CFBundleExecutable</key>
+            <string>hrrr-gui</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --deep -s - "HRRR Viewer.app"
+          hdiutil create -volname "HRRR Viewer" -srcfolder "HRRR Viewer.app" -ov -format UDZO HRRRViewer-macOS-AppleSilicon.dmg
+
+      - name: Codesign CLI (macOS)
         if: runner.os == 'macOS'
-        run: codesign --force -s - target/${{ matrix.target }}/release/hrrr-render
+        run: codesign --force -s - target/${{ matrix.target }}/release/hrrr-render || true
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -57,6 +133,7 @@ jobs:
         run: |
           mkdir -p staging
           cp target/${{ matrix.target }}/release/hrrr-render${{ matrix.ext }} staging/
+          cp target/${{ matrix.target }}/release/hrrr-gui${{ matrix.ext }} staging/
           cd staging
           7z a ../${{ matrix.artifact }}.zip *
 
@@ -64,14 +141,17 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/hrrr-render staging/
+          cp target/${{ matrix.target }}/release/hrrr-render staging/ || true
+          cp target/${{ matrix.target }}/release/hrrr-gui staging/ || true
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.*
+          path: |
+            ${{ matrix.artifact }}.*
+            HRRRViewer-*.dmg
 
   release:
     needs: build
@@ -85,21 +165,40 @@ jobs:
           merge-multiple: true
 
       - name: List artifacts
-        run: ls -R artifacts/
+        run: ls -R artifacts/ || ls -R .
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: |
+            artifacts/*
+            HRRRViewer-*.dmg
           body: |
-            ## hrrr-render ${{ github.ref_name }}
+            ## HRRR Viewer ${{ github.ref_name }}
 
-            High-performance HRRR (High-Resolution Rapid Refresh) weather map renderer.
+            Interactive HRRR weather model viewer with real-time rendering on Natural Earth base maps.
 
-            Renders GRIB2 data to PNG maps with geographic projections, colortables, and shapefile overlays.
+            ### What's New
+            - **Interactive GUI** - Pan/zoom map viewer with cursor lat/lon and data readout
+            - **55+ weather fields** organized by category (Surface, Radar, Severe, Shear, Mesoscale, Moisture, Upper Air, Boundary Layer, Composites)
+            - **Animation loop** - Play through forecast hours with configurable speed and range
+            - **GIF export** - Save animation loops as animated GIFs
+            - **Frame caching** - Previously viewed forecast hours load instantly
+            - **Run picker** - Dropdown with last 24 model cycles
+
+            ### Severe Weather Parameters
+            SB/ML/MU CAPE & CIN, 0-3km CAPE, Lifted Index, SRH (0-1km, 0-3km), Effective Helicity, Critical Angle, Bunkers Storm Motion, Max Updraft Helicity (2-5km, 0-2km, 0-3km), Max Updraft/Downdraft Velocity, Relative Vorticity, Hail Size, Lightning Threat, ESP, and more.
 
             ### Downloads
-            - **Windows** (x86_64): `.zip`
-            - **macOS Intel** (x86_64): `.tar.gz`
-            - **macOS Apple Silicon** (aarch64): `.tar.gz`
-            - **Linux** (x86_64): `.tar.gz`
+            | Platform | File |
+            |----------|------|
+            | Windows x64 | `hrrr-render-windows-x86_64.zip` (includes CLI + GUI) |
+            | macOS Apple Silicon | `HRRRViewer-macOS-AppleSilicon.dmg` |
+            | macOS Intel | `HRRRViewer-macOS-Intel.dmg` |
+            | Linux x64 | `hrrr-render-linux-x86_64.tar.gz` |
+
+            ### macOS Users
+            If you see a Gatekeeper warning, right-click the app and select "Open", or run:
+            ```
+            xattr -cr "/Applications/HRRR Viewer.app"
+            ```
           generate_release_notes: true
