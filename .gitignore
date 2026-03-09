@@ -3,3 +3,4 @@ Cargo.lock
 *.grib2
 *.idx
 *.png
+output/

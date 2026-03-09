@@ -11,15 +11,20 @@ pub fn contour_mask(
     ny: usize,
     interval: f64,
 ) -> Vec<bool> {
-    let mut mask = vec![false; nx * ny];
+    let total = values.len();
+    let mut mask = vec![false; total];
 
-    for j in 0..ny - 1 {
-        for i in 0..nx - 1 {
+    for j in 0..ny.saturating_sub(1) {
+        for i in 0..nx.saturating_sub(1) {
             let idx = j * nx + i;
+            let idx10 = idx + 1;
+            let idx01 = (j + 1) * nx + i;
+            let idx11 = (j + 1) * nx + i + 1;
+            if idx11 >= total { continue; }
             let v00 = values[idx];
-            let v10 = values[idx + 1];
-            let v01 = values[(j + 1) * nx + i];
-            let v11 = values[(j + 1) * nx + i + 1];
+            let v10 = values[idx10];
+            let v01 = values[idx01];
+            let v11 = values[idx11];
 
             if v00.is_nan() || v10.is_nan() || v01.is_nan() || v11.is_nan() {
                 continue;
@@ -36,9 +41,9 @@ pub fn contour_mask(
                 // There's at least one contour crossing this cell
                 // Mark all four corners
                 mask[idx] = true;
-                mask[idx + 1] = true;
-                mask[(j + 1) * nx + i] = true;
-                mask[(j + 1) * nx + i + 1] = true;
+                if idx10 < total { mask[idx10] = true; }
+                if idx01 < total { mask[idx01] = true; }
+                if idx11 < total { mask[idx11] = true; }
             }
         }
     }

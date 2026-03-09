@@ -154,6 +154,10 @@ pub fn render_to_png(
                 }
 
                 let idx = j as usize * nx + i as usize;
+                if idx >= values.len() {
+                    row_pixels.push(bg);
+                    continue;
+                }
                 let val = values[idx];
 
                 if val.is_nan() {

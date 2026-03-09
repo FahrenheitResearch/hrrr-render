@@ -1,10 +1,4 @@
 /// hrrr-render: The world's fastest HRRR weather map renderer.
-///
-/// This library provides:
-/// - GRIB2 parsing (sections 0-8, simple packing + JPEG2000)
-/// - Byte-range fetching from NOAA's AWS S3 HRRR archive
-/// - Parallel map rendering with Lambert Conformal Conic projection
-/// - Color tables for common weather fields
 
 pub mod fetch;
 pub mod fields;
@@ -21,7 +15,6 @@ pub fn render_field(
     width: u32,
     height: u32,
 ) -> io::Result<Vec<u8>> {
-    // Look up field definition
     let field = fields::lookup_field(field_name).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -33,7 +26,6 @@ pub fn render_field(
         )
     })?;
 
-    // Parse run time
     let (date, run_hour) = fetch::parse_run(run)?;
 
     eprintln!(
@@ -41,65 +33,54 @@ pub fn render_field(
         field.label, field.unit, date, run_hour, forecast_hour
     );
 
-    // Fetch the GRIB2 data for this field
     let grib_data = fetch::fetch_field(&date, run_hour, forecast_hour, field.idx_name, field.level)?;
 
-    // Parse the GRIB2 message
-    let messages = grib2::parse_messages(&grib_data)?;
-    if messages.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "No GRIB2 messages found in downloaded data",
-        ));
-    }
+    // Parse using the grib crate
+    let (mut values, nx, ny) = parse_grib2_field(&grib_data)?;
 
-    let msg = &messages[0];
-    eprintln!(
-        "GRIB2: discipline={}, category={}, parameter={}",
-        msg.indicator.discipline,
-        msg.product_definition.parameter_category,
-        msg.product_definition.parameter_number
-    );
-
-    // Get grid info
-    let grid = msg.lambert_grid().unwrap_or_else(|_| {
-        eprintln!("Warning: Could not parse Lambert grid from GRIB2, using HRRR defaults");
-        grib2::templates::LambertConformal {
-            nx: 1799,
-            ny: 1059,
-            la1: 21.138,
-            lo1: -122.72,
-            lad: 38.5,
-            lov: -97.5,
-            dx: 3000.0,
-            dy: 3000.0,
-            latin1: 38.5,
-            latin2: 38.5,
-            scan_mode: 0x40,
-        }
-    });
-
-    eprintln!("Grid: {}x{}, la1={}, lo1={}", grid.nx, grid.ny, grid.la1, grid.lo1);
-
-    // Unpack data values
-    let mut values = msg.unpack_values()?;
-    eprintln!("Unpacked {} values", values.len());
+    eprintln!("Unpacked {} values ({}x{})", values.len(), nx, ny);
 
     // Apply unit conversions
     fields::convert_values(field, &mut values);
 
-    // Set up projection
+    // Set up projection with HRRR standard parameters
     let proj = render::projection::LambertProjection::new(
-        grid.latin1, grid.latin2, grid.lov,
-        grid.la1, grid.lo1,
-        grid.dx, grid.dy,
-        grid.nx, grid.ny,
+        38.5, 38.5, -97.5,
+        21.138, -122.72,
+        3000.0, 3000.0,
+        nx as u32, ny as u32,
     );
 
-    // Render to PNG
     let png_data = render::render_to_png(&values, field, &proj, width, height)?;
-
-    eprintln!("Rendered {}x{} PNG ({} bytes)", width + 60, height, png_data.len());
-
     Ok(png_data)
+}
+
+/// Parse a GRIB2 byte buffer using the `grib` crate and return (values, nx, ny).
+pub fn parse_grib2_field(data: &[u8]) -> io::Result<(Vec<f64>, usize, usize)> {
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(data);
+    let grib2 = grib::Grib2::<grib::SeekableGrib2Reader<Cursor<&[u8]>>>::read_with_seekable(cursor)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("GRIB2 parse error: {:?}", e)))?;
+
+    // Get the first submessage
+    let mut submessages = grib2.submessages();
+    let (_, first) = submessages.next().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "No submessages in GRIB2 data")
+    })?;
+
+    // Get grid shape
+    let (nx, ny) = first.grid_shape()
+        .unwrap_or((1799, 1059));
+
+    // Decode data values
+    let decoder = grib::Grib2SubmessageDecoder::from(first)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decoder init error: {:?}", e)))?;
+
+    let decoded = decoder.dispatch()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decode error: {:?}", e)))?;
+
+    let values: Vec<f64> = decoded.map(|v| v as f64).collect();
+
+    Ok((values, nx, ny))
 }
