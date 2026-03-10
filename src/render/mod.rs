@@ -19,12 +19,9 @@ use std::sync::OnceLock;
 
 use crate::fields::FieldDef;
 
-/// Cached base map pixels (ocean fill, land polygons, lakes).
+/// Cached base map pixels (ocean fill, land polygons, lakes — NO borders/coastlines).
+/// Borders are drawn AFTER weather data so they're always visible.
 static BASE_MAP_CACHE: OnceLock<Vec<[u8; 4]>> = OnceLock::new();
-
-/// Cached overlay features (borders, coastlines, rivers, cities) drawn on top of the base map.
-/// This stores the complete base+overlay composite so we can clone it directly.
-static BASE_OVERLAY_CACHE: OnceLock<Vec<[u8; 4]>> = OnceLock::new();
 
 /// Build the base map (ocean, land, lakes) and cache it.
 fn get_cached_base_map(
@@ -36,20 +33,6 @@ fn get_cached_base_map(
     BASE_MAP_CACHE.get_or_init(|| {
         let mut pixel_buf = vec![[20u8, 20, 30, 255]; (img_width * height) as usize];
         mapbase::draw_base_map(&mut pixel_buf, img_width, height, proj, data_width);
-        pixel_buf
-    })
-}
-
-/// Build the base map + overlay features composite and cache it.
-fn get_cached_base_overlay(
-    img_width: u32,
-    height: u32,
-    proj: &LambertProjection,
-    data_width: u32,
-) -> &'static Vec<[u8; 4]> {
-    BASE_OVERLAY_CACHE.get_or_init(|| {
-        let mut pixel_buf = get_cached_base_map(img_width, height, proj, data_width).clone();
-        mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, data_width);
         pixel_buf
     })
 }
@@ -80,8 +63,8 @@ pub fn render_to_png(
     let legend_width = 60u32;
     let img_width = width + legend_width;
 
-    // 1. Start from cached base+overlay (ocean, land, lakes, borders, coastlines, rivers, cities)
-    let mut pixel_buf = get_cached_base_overlay(img_width, height, proj, width).clone();
+    // 1. Start from cached base map (ocean, land, lakes — no borders yet)
+    let mut pixel_buf = get_cached_base_map(img_width, height, proj, width).clone();
 
     // 2. Overlay weather data on top of base map (parallelized by row)
     let is_transparent_field = matches!(field.name, "ref" | "precip");
@@ -135,6 +118,9 @@ pub fn render_to_png(
                 }
             }
         });
+
+    // 3. Draw borders, coastlines, rivers, cities ON TOP of weather data
+    mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, width);
 
     // Draw legend labels
     draw_legend_labels(&mut pixel_buf, img_width, height, width, legend_width, field);
@@ -256,8 +242,8 @@ pub fn render_to_pixels(
     let legend_width = 60u32;
     let img_width = width + legend_width;
 
-    // 1. Start from cached base+overlay
-    let mut pixel_buf = get_cached_base_overlay(img_width, height, proj, width).clone();
+    // 1. Start from cached base map (ocean, land, lakes — no borders yet)
+    let mut pixel_buf = get_cached_base_map(img_width, height, proj, width).clone();
 
     // 2. Overlay weather data (parallelized by row)
     let is_transparent_field = matches!(field.name, "ref" | "precip");
@@ -311,7 +297,10 @@ pub fn render_to_pixels(
             }
         });
 
-    // 3. Legend labels and title (applied after parallel section)
+    // 3. Draw borders, coastlines, rivers, cities ON TOP of weather data
+    mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, width);
+
+    // 4. Legend labels and title (applied after parallel section)
     draw_legend_labels(&mut pixel_buf, img_width, height, width, legend_width, field);
     draw_title(&mut pixel_buf, img_width, field);
 

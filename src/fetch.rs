@@ -156,6 +156,184 @@ pub fn fetch_idx(date: &str, run_hour: u8, forecast_hour: u8) -> io::Result<Vec<
     Ok(entries)
 }
 
+/// Global idx cache for product variants, keyed by (date, run_hour, forecast_hour, product).
+fn idx_cache_product() -> &'static Mutex<HashMap<(String, u8, u8, String), Vec<IdxEntry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u8, u8, String), Vec<IdxEntry>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Build the URL for a HRRR GRIB2 file with a specific product type (e.g. "wrfsfcf" or "wrfprsf").
+pub fn grib2_url_product(date: &str, run_hour: u8, forecast_hour: u8, product: &str) -> String {
+    format!(
+        "{}/hrrr.{}/conus/hrrr.t{:02}z.{}{:02}.grib2",
+        HRRR_BASE_URL, date, run_hour, product, forecast_hour
+    )
+}
+
+/// Build the URL for the .idx sidecar file for a specific product type.
+pub fn idx_url_product(date: &str, run_hour: u8, forecast_hour: u8, product: &str) -> String {
+    format!("{}.idx", grib2_url_product(date, run_hour, forecast_hour, product))
+}
+
+/// Download and parse the .idx file for a given run/forecast/product.
+/// Results are cached so repeated calls for the same (date, run_hour, forecast_hour, product) are free.
+pub fn fetch_idx_product(
+    date: &str,
+    run_hour: u8,
+    forecast_hour: u8,
+    product: &str,
+) -> io::Result<Vec<IdxEntry>> {
+    let key = (date.to_string(), run_hour, forecast_hour, product.to_string());
+
+    // Check cache first
+    {
+        let cache = idx_cache_product().lock().unwrap();
+        if let Some(entries) = cache.get(&key) {
+            return Ok(entries.clone());
+        }
+    }
+
+    // Cache miss - fetch from network
+    let url = idx_url_product(date, run_hour, forecast_hour, product);
+    eprintln!("Fetching idx: {}", url);
+
+    let resp = shared_client().get(&url).send().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("HTTP error fetching idx: {}", e),
+        )
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Failed to fetch idx (HTTP {}): {}", resp.status(), url),
+        ));
+    }
+
+    let text = resp.text().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Error reading idx body: {}", e),
+        )
+    })?;
+
+    let entries = parse_idx(&text)?;
+
+    // Store in cache
+    {
+        let mut cache = idx_cache_product().lock().unwrap();
+        cache.insert(key, entries.clone());
+    }
+
+    Ok(entries)
+}
+
+/// Download a byte range of a GRIB2 file for a specific product type.
+/// Does not print to stderr (caller handles logging).
+pub fn fetch_grib2_range_product(
+    date: &str,
+    run_hour: u8,
+    forecast_hour: u8,
+    start: u64,
+    end: Option<u64>,
+    product: &str,
+) -> io::Result<Vec<u8>> {
+    let url = grib2_url_product(date, run_hour, forecast_hour, product);
+
+    let range = match end {
+        Some(e) => format!("bytes={}-{}", start, e),
+        None => format!("bytes={}-", start),
+    };
+
+    let resp = shared_client()
+        .get(&url)
+        .header("Range", &range)
+        .send()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HTTP error: {}", e)))?;
+
+    if !resp.status().is_success() && resp.status().as_u16() != 206 {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("HTTP {} fetching GRIB2 data", resp.status()),
+        ));
+    }
+
+    let bytes = resp
+        .bytes()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Error reading body: {}", e)))?;
+
+    Ok(bytes.to_vec())
+}
+
+/// Fetch multiple fields in parallel from a specific product type.
+///
+/// Fetches the idx once (cached), then downloads all requested GRIB2 byte ranges concurrently.
+/// `fields` is a slice of (idx_name, level) pairs.
+/// Returns a Vec of GRIB2 byte buffers in the same order as the input fields.
+pub fn fetch_fields_parallel_product(
+    date: &str,
+    run_hour: u8,
+    fhour: u8,
+    fields: &[(&str, &str)],
+    product: &str,
+) -> io::Result<Vec<Vec<u8>>> {
+    // Fetch and cache idx once
+    let entries = fetch_idx_product(date, run_hour, fhour, product)?;
+
+    // Resolve all byte ranges up front (fast, no I/O)
+    // Use exact matching for product files (pressure levels need exact "500 mb" not "1500 mb")
+    let ranges: Vec<(u64, Option<u64>)> = fields
+        .iter()
+        .map(|(name, level)| find_field_range_exact(&entries, name, level)
+            .or_else(|_| find_field_range(&entries, name, level)))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    // Fetch all ranges in parallel via rayon
+    let results: Vec<io::Result<Vec<u8>>> = ranges
+        .into_par_iter()
+        .map(|(start, end)| fetch_grib2_range_product(date, run_hour, fhour, start, end, product))
+        .collect();
+
+    // Collect results, propagating the first error
+    results.into_iter().collect()
+}
+
+/// Find the byte range for a specific field, matching the level string exactly.
+/// Unlike `find_field_range` which uses `.contains()`, this requires `entry.level == level`.
+/// This is needed for pressure level fields where "500 mb" shouldn't match "1500 mb".
+pub fn find_field_range_exact(
+    entries: &[IdxEntry],
+    idx_name: &str,
+    level: &str,
+) -> io::Result<(u64, Option<u64>)> {
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.field_name == idx_name && entry.level == level {
+            let start = entry.byte_offset;
+            let end = if i + 1 < entries.len() {
+                Some(entries[i + 1].byte_offset - 1)
+            } else {
+                None
+            };
+            return Ok((start, end));
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "Field '{}' at level '{}' not found in idx (exact match). Available fields: {}",
+            idx_name,
+            level,
+            entries
+                .iter()
+                .map(|e| format!("{}:{}", e.field_name, e.level))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
 /// Parse .idx file contents.
 /// Format: `linenum:byte_offset:d=YYYYMMDDHH:FIELD:level:fcst`
 pub fn parse_idx(text: &str) -> io::Result<Vec<IdxEntry>> {

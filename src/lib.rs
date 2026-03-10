@@ -5,6 +5,7 @@ pub mod fetch;
 pub mod fields;
 pub mod grib2;
 pub mod render;
+pub mod sounding;
 
 use std::io;
 
