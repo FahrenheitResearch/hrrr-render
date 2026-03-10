@@ -6,17 +6,6 @@
 use std::io;
 use crate::fetch;
 
-/// Fetch a single GRIB2 field, parse, and optionally convert units.
-/// Returns raw values (no unit conversion) unless convert=true.
-fn fetch_component(
-    date: &str, run_hour: u8, fhour: u8,
-    idx_name: &str, level: &str,
-) -> io::Result<Vec<f64>> {
-    let data = fetch::fetch_field(date, run_hour, fhour, idx_name, level)?;
-    let (values, _nx, _ny) = crate::parse_grib2_field(&data)?;
-    Ok(values)
-}
-
 /// Check if a field name is a composite that requires multi-fetch.
 pub fn is_composite(name: &str) -> bool {
     matches!(name, "stp" | "scp" | "ship" | "shr01" | "shr06" | "ebs")
@@ -80,11 +69,17 @@ fn compute_bulk_shear(
     date: &str, run_hour: u8, fhour: u8, level: &str,
     status_fn: &dyn Fn(&str),
 ) -> io::Result<(Vec<f64>, usize, usize)> {
-    status_fn(&format!("Fetching U-shear {}...", level));
-    let u = fetch_component(date, run_hour, fhour, "VUCSH", level)?;
+    let fields: &[(&str, &str)] = &[
+        ("VUCSH", level),
+        ("VVCSH", level),
+    ];
 
-    status_fn(&format!("Fetching V-shear {}...", level));
-    let v = fetch_component(date, run_hour, fhour, "VVCSH", level)?;
+    status_fn("Fetching 2 components...");
+    let results = fetch::fetch_fields_parallel(date, run_hour, fhour, fields)?;
+
+    status_fn("Computing...");
+    let (u, nx, ny) = crate::parse_grib2_field(&results[0])?;
+    let (v, _, _) = crate::parse_grib2_field(&results[1])?;
 
     let n = u.len();
     let mut values = vec![f64::NAN; n];
@@ -95,9 +90,6 @@ fn compute_bulk_shear(
         }
     }
 
-    let (_, nx, ny) = crate::parse_grib2_field(
-        &fetch::fetch_field(date, run_hour, fhour, "VUCSH", level)?
-    )?;
     Ok((values, nx, ny))
 }
 
@@ -120,26 +112,25 @@ fn compute_stp(
     date: &str, run_hour: u8, fhour: u8,
     status_fn: &dyn Fn(&str),
 ) -> io::Result<(Vec<f64>, usize, usize)> {
-    status_fn("Fetching MLCAPE...");
-    let mlcape = fetch_component(date, run_hour, fhour, "CAPE", "90-0 mb above ground")?;
+    let fields: &[(&str, &str)] = &[
+        ("CAPE", "90-0 mb above ground"),
+        ("CIN", "90-0 mb above ground"),
+        ("HLCY", "1000-0 m above ground"),
+        ("VUCSH", "0-6000 m above ground"),
+        ("VVCSH", "0-6000 m above ground"),
+        ("HGT", "level of adiabatic condensation from sfc"),
+    ];
 
-    status_fn("Fetching MLCIN...");
-    let mlcin = fetch_component(date, run_hour, fhour, "CIN", "90-0 mb above ground")?;
+    status_fn("Fetching 6 components...");
+    let results = fetch::fetch_fields_parallel(date, run_hour, fhour, fields)?;
 
-    status_fn("Fetching 0-1km SRH...");
-    let srh1 = fetch_component(date, run_hour, fhour, "HLCY", "1000-0 m above ground")?;
-
-    status_fn("Fetching 0-6km U-shear...");
-    let shr_u = fetch_component(date, run_hour, fhour, "VUCSH", "0-6000 m above ground")?;
-    status_fn("Fetching 0-6km V-shear...");
-    let shr_v = fetch_component(date, run_hour, fhour, "VVCSH", "0-6000 m above ground")?;
-
-    status_fn("Fetching LCL height...");
-    let lcl = fetch_component(date, run_hour, fhour, "HGT", "level of adiabatic condensation from sfc")?;
-
-    // Get grid dimensions from one of the fields
-    let data = fetch::fetch_field(date, run_hour, fhour, "CAPE", "90-0 mb above ground")?;
-    let (_, nx, ny) = crate::parse_grib2_field(&data)?;
+    status_fn("Computing...");
+    let (mlcape, nx, ny) = crate::parse_grib2_field(&results[0])?;
+    let (mlcin, _, _) = crate::parse_grib2_field(&results[1])?;
+    let (srh1, _, _) = crate::parse_grib2_field(&results[2])?;
+    let (shr_u, _, _) = crate::parse_grib2_field(&results[3])?;
+    let (shr_v, _, _) = crate::parse_grib2_field(&results[4])?;
+    let (lcl, _, _) = crate::parse_grib2_field(&results[5])?;
 
     let n = mlcape.len();
     let mut values = vec![f64::NAN; n];
@@ -189,19 +180,21 @@ fn compute_scp(
     date: &str, run_hour: u8, fhour: u8,
     status_fn: &dyn Fn(&str),
 ) -> io::Result<(Vec<f64>, usize, usize)> {
-    status_fn("Fetching MUCAPE...");
-    let mucape = fetch_component(date, run_hour, fhour, "CAPE", "180-0 mb above ground")?;
+    let fields: &[(&str, &str)] = &[
+        ("CAPE", "180-0 mb above ground"),
+        ("HLCY", "3000-0 m above ground"),
+        ("VUCSH", "0-6000 m above ground"),
+        ("VVCSH", "0-6000 m above ground"),
+    ];
 
-    status_fn("Fetching 0-3km SRH...");
-    let srh3 = fetch_component(date, run_hour, fhour, "HLCY", "3000-0 m above ground")?;
+    status_fn("Fetching 4 components...");
+    let results = fetch::fetch_fields_parallel(date, run_hour, fhour, fields)?;
 
-    status_fn("Fetching 0-6km U-shear...");
-    let shr_u = fetch_component(date, run_hour, fhour, "VUCSH", "0-6000 m above ground")?;
-    status_fn("Fetching 0-6km V-shear...");
-    let shr_v = fetch_component(date, run_hour, fhour, "VVCSH", "0-6000 m above ground")?;
-
-    let data = fetch::fetch_field(date, run_hour, fhour, "CAPE", "180-0 mb above ground")?;
-    let (_, nx, ny) = crate::parse_grib2_field(&data)?;
+    status_fn("Computing...");
+    let (mucape, nx, ny) = crate::parse_grib2_field(&results[0])?;
+    let (srh3, _, _) = crate::parse_grib2_field(&results[1])?;
+    let (shr_u, _, _) = crate::parse_grib2_field(&results[2])?;
+    let (shr_v, _, _) = crate::parse_grib2_field(&results[3])?;
 
     let n = mucape.len();
     let mut values = vec![f64::NAN; n];
@@ -235,25 +228,25 @@ fn compute_ship(
     date: &str, run_hour: u8, fhour: u8,
     status_fn: &dyn Fn(&str),
 ) -> io::Result<(Vec<f64>, usize, usize)> {
-    status_fn("Fetching MUCAPE...");
-    let mucape = fetch_component(date, run_hour, fhour, "CAPE", "180-0 mb above ground")?;
+    let fields: &[(&str, &str)] = &[
+        ("CAPE", "180-0 mb above ground"),
+        ("TMP", "500 mb"),
+        ("TMP", "700 mb"),
+        ("DPT", "700 mb"),
+        ("VUCSH", "0-6000 m above ground"),
+        ("VVCSH", "0-6000 m above ground"),
+    ];
 
-    status_fn("Fetching 500mb Temperature...");
-    let t500 = fetch_component(date, run_hour, fhour, "TMP", "500 mb")?;
+    status_fn("Fetching 6 components...");
+    let results = fetch::fetch_fields_parallel(date, run_hour, fhour, fields)?;
 
-    status_fn("Fetching 700mb Temperature...");
-    let t700 = fetch_component(date, run_hour, fhour, "TMP", "700 mb")?;
-
-    status_fn("Fetching 700mb Dewpoint...");
-    let td700 = fetch_component(date, run_hour, fhour, "DPT", "700 mb")?;
-
-    status_fn("Fetching 0-6km U-shear...");
-    let shr_u = fetch_component(date, run_hour, fhour, "VUCSH", "0-6000 m above ground")?;
-    status_fn("Fetching 0-6km V-shear...");
-    let shr_v = fetch_component(date, run_hour, fhour, "VVCSH", "0-6000 m above ground")?;
-
-    let data = fetch::fetch_field(date, run_hour, fhour, "CAPE", "180-0 mb above ground")?;
-    let (_, nx, ny) = crate::parse_grib2_field(&data)?;
+    status_fn("Computing...");
+    let (mucape, nx, ny) = crate::parse_grib2_field(&results[0])?;
+    let (t500, _, _) = crate::parse_grib2_field(&results[1])?;
+    let (t700, _, _) = crate::parse_grib2_field(&results[2])?;
+    let (td700, _, _) = crate::parse_grib2_field(&results[3])?;
+    let (shr_u, _, _) = crate::parse_grib2_field(&results[4])?;
+    let (shr_v, _, _) = crate::parse_grib2_field(&results[5])?;
 
     let n = mucape.len();
     let mut values = vec![f64::NAN; n];

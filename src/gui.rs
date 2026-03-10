@@ -107,7 +107,13 @@ struct HrrrApp {
 
     // Frame cache: keyed by (field_key, forecast_hour), cleared on run change
     frame_cache: HashMap<(String, u8), CachedFrame>,
+    cache_lru: Vec<(String, u8)>,  // LRU order: oldest first
+    cache_max_frames: usize,
     cache_run_mode: String,
+
+    // Background prefetch
+    prefetch_active: Arc<Mutex<std::collections::HashSet<(String, u8)>>>,
+    prefetch_incoming: Arc<Mutex<Vec<IncomingFrame>>>,
 
     // Animation
     animating: bool,
@@ -152,7 +158,11 @@ impl HrrrApp {
             cached_field_unit: String::new(),
             cached_img_width: 1799 + 60,
             frame_cache: HashMap::new(),
+            cache_lru: Vec::new(),
+            cache_max_frames: 200,
             cache_run_mode: "latest".to_string(),
+            prefetch_active: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            prefetch_incoming: Arc::new(Mutex::new(Vec::new())),
             animating: false,
             anim_start: 0,
             anim_end: 18,
@@ -179,7 +189,91 @@ impl HrrrApp {
     fn check_cache_validity(&mut self) {
         if self.cache_run_mode != self.run_mode {
             self.frame_cache.clear();
+            self.cache_lru.clear();
             self.cache_run_mode = self.run_mode.clone();
+        }
+    }
+
+    /// Insert a frame into cache with LRU eviction.
+    fn cache_insert(&mut self, key: (String, u8), frame: CachedFrame) {
+        // Remove from LRU if already exists (will re-add at end)
+        self.cache_lru.retain(|k| k != &key);
+
+        // Evict oldest frames if over limit
+        while self.frame_cache.len() >= self.cache_max_frames && !self.cache_lru.is_empty() {
+            let evict_key = self.cache_lru.remove(0);
+            self.frame_cache.remove(&evict_key);
+        }
+
+        self.cache_lru.push(key.clone());
+        self.frame_cache.insert(key, frame);
+    }
+
+    /// Touch a cache entry (move to end of LRU).
+    fn cache_touch(&mut self, key: &(String, u8)) {
+        if let Some(pos) = self.cache_lru.iter().position(|k| k == key) {
+            let k = self.cache_lru.remove(pos);
+            self.cache_lru.push(k);
+        }
+    }
+
+    /// Prefetch adjacent forecast hours in background.
+    fn prefetch_adjacent(&self, ctx: &egui::Context) {
+        let current = self.forecast_hour;
+        let field_key = self.current_field_key();
+        let hours: Vec<u8> = [
+            current.wrapping_sub(2), current.wrapping_sub(1),
+            current + 1, current + 2,
+        ].iter().copied().filter(|&h| h <= 48).collect();
+
+        for hour in hours {
+            let key = (field_key.clone(), hour);
+            if self.frame_cache.contains_key(&key) { continue; }
+
+            // Check if already prefetching this
+            {
+                let mut active = self.prefetch_active.lock().unwrap();
+                if active.contains(&key) { continue; }
+                active.insert(key.clone());
+            }
+
+            let run = self.run_mode.clone();
+            let width = self.render_width;
+            let height = self.render_height;
+            let ctx = ctx.clone();
+            let composite_name = self.selected_composite.clone();
+            let field_key_clone = field_key.clone();
+            let prefetch_active = Arc::clone(&self.prefetch_active);
+            let prefetch_incoming = Arc::clone(&self.prefetch_incoming);
+            let selected_field = self.selected_field;
+
+            std::thread::spawn(move || {
+                let dummy_state = Arc::new(Mutex::new(FetchState {
+                    incoming: None, status: String::new(), fetching: false,
+                }));
+
+                let result = if let Some(ref comp_name) = composite_name {
+                    let comp_label = COMPOSITE_FIELDS.iter()
+                        .find(|c| c.name == comp_name.as_str())
+                        .map(|c| c.label).unwrap_or(comp_name.as_str()).to_string();
+                    fetch_and_render_composite(
+                        comp_name, &comp_label, &run, hour, width, height, &dummy_state, &ctx,
+                    )
+                } else {
+                    let field = FIELDS[selected_field].clone();
+                    fetch_and_render(&field, &run, hour, width, height, &dummy_state, &ctx)
+                };
+
+                if let Ok((frame, _, _, _)) = result {
+                    prefetch_incoming.lock().unwrap().push(IncomingFrame {
+                        frame, forecast_hour: hour,
+                        field_key: field_key_clone.clone(),
+                    });
+                }
+
+                prefetch_active.lock().unwrap().remove(&(field_key_clone, hour));
+                ctx.request_repaint();
+            });
         }
     }
 
@@ -187,6 +281,7 @@ impl HrrrApp {
     fn load_from_cache(&mut self, fhour: u8, ctx: &egui::Context) -> bool {
         self.check_cache_validity();
         let key = (self.current_field_key(), fhour);
+        self.cache_touch(&key);
         if let Some(cached) = self.frame_cache.get(&key) {
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [cached.width as usize, cached.height as usize],
@@ -598,38 +693,52 @@ impl eframe::App for HrrrApp {
         }
 
         // Receive rendered frames and cache them
+        let incoming_frame = self.fetch_state.lock().unwrap().incoming.take();
+        if let Some(incoming) = incoming_frame {
+            let fhour = incoming.forecast_hour;
+            let frame = incoming.frame;
+
+            // Update texture
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.pixels,
+            );
+            self.texture = Some(ctx.load_texture(
+                "hrrr_map", color_image, egui::TextureOptions::LINEAR,
+            ));
+            self.tex_size = [frame.width, frame.height];
+            self.cached_values = Some(frame.values.clone());
+            self.cached_nx = frame.nx;
+            self.cached_ny = frame.ny;
+            self.cached_field_idx = self.selected_field;
+            self.cached_field_unit = if let Some(ref comp) = self.selected_composite {
+                COMPOSITE_FIELDS.iter()
+                    .find(|c| c.name == comp.as_str())
+                    .map(|c| c.unit.to_string())
+                    .unwrap_or_default()
+            } else {
+                FIELDS[self.selected_field].unit.to_string()
+            };
+            self.cached_img_width = frame.width;
+
+            // Store in cache with LRU eviction
+            let cache_key = (incoming.field_key, fhour);
+            self.cache_insert(cache_key, frame);
+
+            // Prefetch adjacent hours in background
+            if !self.animating {
+                self.prefetch_adjacent(ctx);
+            }
+        }
+
+        // Drain prefetch queue into cache (don't update texture)
         {
-            let mut s = self.fetch_state.lock().unwrap();
-            if let Some(incoming) = s.incoming.take() {
-                let fhour = incoming.forecast_hour;
-                let frame = incoming.frame;
-
-                // Update texture
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                    [frame.width as usize, frame.height as usize],
-                    &frame.pixels,
-                );
-                self.texture = Some(ctx.load_texture(
-                    "hrrr_map", color_image, egui::TextureOptions::LINEAR,
-                ));
-                self.tex_size = [frame.width, frame.height];
-                self.cached_values = Some(frame.values.clone());
-                self.cached_nx = frame.nx;
-                self.cached_ny = frame.ny;
-                self.cached_field_idx = self.selected_field;
-                self.cached_field_unit = if let Some(ref comp) = self.selected_composite {
-                    COMPOSITE_FIELDS.iter()
-                        .find(|c| c.name == comp.as_str())
-                        .map(|c| c.unit.to_string())
-                        .unwrap_or_default()
-                } else {
-                    FIELDS[self.selected_field].unit.to_string()
-                };
-                self.cached_img_width = frame.width;
-
-                // Store in cache
-                let cache_key = (incoming.field_key, fhour);
-                self.frame_cache.insert(cache_key, frame);
+            let prefetched: Vec<IncomingFrame> = self.prefetch_incoming.lock().unwrap().drain(..).collect();
+            for pf in prefetched {
+                let key = (pf.field_key, pf.forecast_hour);
+                if !self.frame_cache.contains_key(&key) {
+                    self.cache_insert(key, pf.frame);
+                }
             }
         }
 
@@ -905,8 +1014,9 @@ impl eframe::App for HrrrApp {
                     let cached_count = self.frame_cache.len();
                     if cached_count > 0 {
                         ui.separator();
-                        ui.label(egui::RichText::new(format!("{} cached", cached_count))
-                            .color(text_dim).size(10.0));
+                        ui.label(egui::RichText::new(
+                            format!("{}/{} cached", cached_count, self.cache_max_frames)
+                        ).color(text_dim).size(10.0));
                     }
                 });
             });

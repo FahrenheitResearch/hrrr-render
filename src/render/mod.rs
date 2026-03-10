@@ -13,9 +13,46 @@ pub mod projection;
 
 use color::{Color, text_color};
 use projection::LambertProjection;
+use rayon::prelude::*;
 use std::io::{self, BufWriter};
+use std::sync::OnceLock;
 
 use crate::fields::FieldDef;
+
+/// Cached base map pixels (ocean fill, land polygons, lakes).
+static BASE_MAP_CACHE: OnceLock<Vec<[u8; 4]>> = OnceLock::new();
+
+/// Cached overlay features (borders, coastlines, rivers, cities) drawn on top of the base map.
+/// This stores the complete base+overlay composite so we can clone it directly.
+static BASE_OVERLAY_CACHE: OnceLock<Vec<[u8; 4]>> = OnceLock::new();
+
+/// Build the base map (ocean, land, lakes) and cache it.
+fn get_cached_base_map(
+    img_width: u32,
+    height: u32,
+    proj: &LambertProjection,
+    data_width: u32,
+) -> &'static Vec<[u8; 4]> {
+    BASE_MAP_CACHE.get_or_init(|| {
+        let mut pixel_buf = vec![[20u8, 20, 30, 255]; (img_width * height) as usize];
+        mapbase::draw_base_map(&mut pixel_buf, img_width, height, proj, data_width);
+        pixel_buf
+    })
+}
+
+/// Build the base map + overlay features composite and cache it.
+fn get_cached_base_overlay(
+    img_width: u32,
+    height: u32,
+    proj: &LambertProjection,
+    data_width: u32,
+) -> &'static Vec<[u8; 4]> {
+    BASE_OVERLAY_CACHE.get_or_init(|| {
+        let mut pixel_buf = get_cached_base_map(img_width, height, proj, data_width).clone();
+        mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, data_width);
+        pixel_buf
+    })
+}
 
 /// Render weather data to a PNG image buffer.
 pub fn render_to_png(
@@ -43,61 +80,61 @@ pub fn render_to_png(
     let legend_width = 60u32;
     let img_width = width + legend_width;
 
-    // 1. Draw base map (ocean, land, lakes) using Natural Earth geodata
-    let mut pixel_buf = vec![[20u8, 20, 30, 255]; (img_width * height) as usize];
-    mapbase::draw_base_map(&mut pixel_buf, img_width, height, proj, width);
+    // 1. Start from cached base+overlay (ocean, land, lakes, borders, coastlines, rivers, cities)
+    let mut pixel_buf = get_cached_base_overlay(img_width, height, proj, width).clone();
 
-    // 2. Overlay weather data on top of base map
+    // 2. Overlay weather data on top of base map (parallelized by row)
     let is_transparent_field = matches!(field.name, "ref" | "precip");
 
-    for row in 0..height {
-        for col in 0..width {
-            let gi = col as f64 * scale_x;
-            let gj = (height - 1 - row) as f64 * scale_y;
+    pixel_buf
+        .par_chunks_mut(img_width as usize)
+        .enumerate()
+        .for_each(|(row, row_pixels)| {
+            let row = row as u32;
+            for col in 0..width {
+                let gi = col as f64 * scale_x;
+                let gj = (height - 1 - row) as f64 * scale_y;
 
-            let i = gi.round() as isize;
-            let j = gj.round() as isize;
+                let i = gi.round() as isize;
+                let j = gj.round() as isize;
 
-            if i < 0 || i >= nx as isize || j < 0 || j >= ny as isize { continue; }
+                if i < 0 || i >= nx as isize || j < 0 || j >= ny as isize { continue; }
 
-            let idx = j as usize * nx + i as usize;
-            if idx >= values.len() { continue; }
-            let val = values[idx];
-            if val.is_nan() { continue; }
+                let idx = j as usize * nx + i as usize;
+                if idx >= values.len() { continue; }
+                let val = values[idx];
+                if val.is_nan() { continue; }
 
-            let c = if let Some(ref cm) = contour_mask {
-                if cm[idx] {
-                    let base = color_fn(color::normalize(val, vmin, vmax));
-                    [(base[0] as f64 * 0.5) as u8, (base[1] as f64 * 0.5) as u8, (base[2] as f64 * 0.5) as u8, 255]
+                let c = if let Some(ref cm) = contour_mask {
+                    if cm[idx] {
+                        let base = color_fn(color::normalize(val, vmin, vmax));
+                        [(base[0] as f64 * 0.5) as u8, (base[1] as f64 * 0.5) as u8, (base[2] as f64 * 0.5) as u8, 255]
+                    } else {
+                        color_fn(color::normalize(val, vmin, vmax))
+                    }
                 } else {
                     color_fn(color::normalize(val, vmin, vmax))
+                };
+
+                // Skip transparent values (no echo for ref/precip)
+                if is_transparent_field && c[3] == 0 { continue; }
+
+                let col = col as usize;
+                if col < row_pixels.len() {
+                    row_pixels[col] = c;
                 }
-            } else {
-                color_fn(color::normalize(val, vmin, vmax))
-            };
-
-            // Skip transparent values (no echo for ref/precip)
-            if is_transparent_field && c[3] == 0 { continue; }
-
-            let pidx = (row * img_width + col) as usize;
-            if pidx < pixel_buf.len() {
-                pixel_buf[pidx] = c;
             }
-        }
 
-        // Legend bar for this row
-        let t = 1.0 - (row as f64 / height as f64);
-        let legend_color = color_fn(t);
-        for lx in 0..legend_width {
-            let pidx = (row * img_width + width + lx) as usize;
-            if pidx < pixel_buf.len() {
-                pixel_buf[pidx] = legend_color;
+            // Legend bar for this row
+            let t = 1.0 - (row as f64 / height as f64);
+            let legend_color = color_fn(t);
+            for lx in 0..legend_width {
+                let pidx = (width + lx) as usize;
+                if pidx < row_pixels.len() {
+                    row_pixels[pidx] = legend_color;
+                }
             }
-        }
-    }
-
-    // 3. Draw overlay features (borders, coastlines, rivers, cities) on top
-    mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, width);
+        });
 
     // Draw legend labels
     draw_legend_labels(&mut pixel_buf, img_width, height, width, legend_width, field);
@@ -219,60 +256,62 @@ pub fn render_to_pixels(
     let legend_width = 60u32;
     let img_width = width + legend_width;
 
-    // 1. Draw base map
-    let mut pixel_buf = vec![[20u8, 20, 30, 255]; (img_width * height) as usize];
-    mapbase::draw_base_map(&mut pixel_buf, img_width, height, proj, width);
+    // 1. Start from cached base+overlay
+    let mut pixel_buf = get_cached_base_overlay(img_width, height, proj, width).clone();
 
-    // 2. Overlay weather data
+    // 2. Overlay weather data (parallelized by row)
     let is_transparent_field = matches!(field.name, "ref" | "precip");
 
-    for row in 0..height {
-        for col in 0..width {
-            let gi = col as f64 * scale_x;
-            let gj = (height - 1 - row) as f64 * scale_y;
+    pixel_buf
+        .par_chunks_mut(img_width as usize)
+        .enumerate()
+        .for_each(|(row, row_pixels)| {
+            let row = row as u32;
+            for col in 0..width {
+                let gi = col as f64 * scale_x;
+                let gj = (height - 1 - row) as f64 * scale_y;
 
-            let i = gi.round() as isize;
-            let j = gj.round() as isize;
+                let i = gi.round() as isize;
+                let j = gj.round() as isize;
 
-            if i < 0 || i >= nx as isize || j < 0 || j >= ny as isize { continue; }
+                if i < 0 || i >= nx as isize || j < 0 || j >= ny as isize { continue; }
 
-            let idx = j as usize * nx + i as usize;
-            if idx >= values.len() { continue; }
-            let val = values[idx];
-            if val.is_nan() { continue; }
+                let idx = j as usize * nx + i as usize;
+                if idx >= values.len() { continue; }
+                let val = values[idx];
+                if val.is_nan() { continue; }
 
-            let c = if let Some(ref cm) = contour_mask {
-                if cm[idx] {
-                    let base = color_fn(color::normalize(val, vmin, vmax));
-                    [(base[0] as f64 * 0.5) as u8, (base[1] as f64 * 0.5) as u8, (base[2] as f64 * 0.5) as u8, 255]
+                let c = if let Some(ref cm) = contour_mask {
+                    if cm[idx] {
+                        let base = color_fn(color::normalize(val, vmin, vmax));
+                        [(base[0] as f64 * 0.5) as u8, (base[1] as f64 * 0.5) as u8, (base[2] as f64 * 0.5) as u8, 255]
+                    } else {
+                        color_fn(color::normalize(val, vmin, vmax))
+                    }
                 } else {
                     color_fn(color::normalize(val, vmin, vmax))
+                };
+
+                if is_transparent_field && c[3] == 0 { continue; }
+
+                let col = col as usize;
+                if col < row_pixels.len() {
+                    row_pixels[col] = c;
                 }
-            } else {
-                color_fn(color::normalize(val, vmin, vmax))
-            };
-
-            if is_transparent_field && c[3] == 0 { continue; }
-
-            let pidx = (row * img_width + col) as usize;
-            if pidx < pixel_buf.len() {
-                pixel_buf[pidx] = c;
             }
-        }
 
-        // Legend bar
-        let t = 1.0 - (row as f64 / height as f64);
-        let legend_color = color_fn(t);
-        for lx in 0..legend_width {
-            let pidx = (row * img_width + width + lx) as usize;
-            if pidx < pixel_buf.len() {
-                pixel_buf[pidx] = legend_color;
+            // Legend bar
+            let t = 1.0 - (row as f64 / height as f64);
+            let legend_color = color_fn(t);
+            for lx in 0..legend_width {
+                let pidx = (width + lx) as usize;
+                if pidx < row_pixels.len() {
+                    row_pixels[pidx] = legend_color;
+                }
             }
-        }
-    }
+        });
 
-    // 3. Overlay features
-    mapbase::draw_overlay_features(&mut pixel_buf, img_width, height, proj, width);
+    // 3. Legend labels and title (applied after parallel section)
     draw_legend_labels(&mut pixel_buf, img_width, height, width, legend_width, field);
     draw_title(&mut pixel_buf, img_width, field);
 
