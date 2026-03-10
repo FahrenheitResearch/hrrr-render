@@ -6,6 +6,7 @@
 
 use eframe::egui;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,20 +29,50 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// A rendered frame that can be cached.
+/// A rendered frame that can be cached (compressed to save RAM).
 #[derive(Clone)]
 struct CachedFrame {
-    pixels: Vec<u8>,    // flat RGBA
+    compressed_pixels: Vec<u8>,  // flate2-compressed RGBA
     width: u32,
     height: u32,
-    values: Vec<f64>,   // for cursor readout
+}
+
+impl CachedFrame {
+    /// Compress raw RGBA pixels into a cached frame.
+    fn compress(pixels: &[u8], width: u32, height: u32) -> Self {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(pixels).unwrap();
+        let compressed = encoder.finish().unwrap();
+        Self { compressed_pixels: compressed, width, height }
+    }
+
+    /// Decompress pixels back to raw RGBA.
+    fn decompress(&self) -> Vec<u8> {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+        let mut decoder = DeflateDecoder::new(&self.compressed_pixels[..]);
+        let mut pixels = Vec::with_capacity((self.width * self.height * 4) as usize);
+        decoder.read_to_end(&mut pixels).unwrap();
+        pixels
+    }
+}
+
+/// Uncompressed frame data arriving from a background fetch thread.
+struct FetchedFrame {
+    pixels: Vec<u8>,    // flat RGBA (uncompressed)
+    width: u32,
+    height: u32,
+    values: Vec<f64>,   // for cursor readout (not cached)
     nx: usize,
     ny: usize,
 }
 
 /// Data arriving from background thread.
 struct IncomingFrame {
-    frame: CachedFrame,
+    frame: FetchedFrame,
     forecast_hour: u8,
     field_key: String,
 }
@@ -62,12 +93,21 @@ struct GifProgress {
     path: Option<String>,
 }
 
+/// Preload progress tracking (shared with background threads).
+struct PreloadProgress {
+    completed: AtomicU32,
+    total: AtomicU32,
+    active: AtomicBool,
+    errors: Mutex<Vec<String>>,
+    label: Mutex<String>,
+}
+
 /// Generate available model run options (last 24 hours of cycles).
 fn available_runs() -> Vec<(String, String)> {
     use chrono::{Utc, Duration, Timelike};
     let now = Utc::now();
     let mut runs = vec![("latest".to_string(), "Latest".to_string())];
-    for hours_ago in 2..26 {
+    for hours_ago in 1..26 {
         let t = now - Duration::hours(hours_ago);
         let code = t.format("%Y%m%d%H").to_string();
         let label = format!("{} {:02}z", t.format("%m/%d"), t.hour());
@@ -126,6 +166,9 @@ struct HrrrApp {
     gif_progress: Arc<Mutex<GifProgress>>,
     exporting_gif: bool,
 
+    // Preloading
+    preload_progress: Arc<PreloadProgress>,
+
     first_frame: bool,
 }
 
@@ -159,19 +202,26 @@ impl HrrrApp {
             cached_img_width: 1799 + 60,
             frame_cache: HashMap::new(),
             cache_lru: Vec::new(),
-            cache_max_frames: 200,
+            cache_max_frames: 4000,
             cache_run_mode: "latest".to_string(),
             prefetch_active: Arc::new(Mutex::new(std::collections::HashSet::new())),
             prefetch_incoming: Arc::new(Mutex::new(Vec::new())),
             animating: false,
             anim_start: 0,
-            anim_end: 18,
+            anim_end: 48,
             anim_speed_ms: 250,
             last_anim_advance: Instant::now(),
             gif_progress: Arc::new(Mutex::new(GifProgress {
                 current: 0, total: 0, done: false, error: None, path: None,
             })),
             exporting_gif: false,
+            preload_progress: Arc::new(PreloadProgress {
+                completed: AtomicU32::new(0),
+                total: AtomicU32::new(0),
+                active: AtomicBool::new(false),
+                errors: Mutex::new(Vec::new()),
+                label: Mutex::new(String::new()),
+            }),
             first_frame: true,
         }
     }
@@ -283,17 +333,17 @@ impl HrrrApp {
         let key = (self.current_field_key(), fhour);
         self.cache_touch(&key);
         if let Some(cached) = self.frame_cache.get(&key) {
+            // Decompress pixels from cache
+            let pixels = cached.decompress();
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 [cached.width as usize, cached.height as usize],
-                &cached.pixels,
+                &pixels,
             );
             self.texture = Some(ctx.load_texture(
                 "hrrr_map", color_image, egui::TextureOptions::LINEAR,
             ));
             self.tex_size = [cached.width, cached.height];
-            self.cached_values = Some(cached.values.clone());
-            self.cached_nx = cached.nx;
-            self.cached_ny = cached.ny;
+            self.cached_values = None; // values not stored in cache
             self.cached_field_idx = self.selected_field;
             self.cached_img_width = cached.width;
             self.forecast_hour = fhour;
@@ -393,6 +443,165 @@ impl HrrrApp {
         self.start_fetch(ctx);
     }
 
+    /// Preload all forecast hours (0-48) for the currently selected field.
+    fn preload_product(&self, ctx: &egui::Context) {
+        if self.preload_progress.active.load(Ordering::Relaxed) { return; }
+
+        let field_key = self.current_field_key();
+        let label = if let Some(ref comp) = self.selected_composite {
+            COMPOSITE_FIELDS.iter()
+                .find(|c| c.name == comp.as_str())
+                .map(|c| c.label.to_string())
+                .unwrap_or_else(|| comp.clone())
+        } else {
+            FIELDS[self.selected_field].label.to_string()
+        };
+
+        // Determine which hours still need fetching
+        let hours_needed: Vec<u8> = (0..=48u8)
+            .filter(|h| !self.frame_cache.contains_key(&(field_key.clone(), *h)))
+            .collect();
+
+        if hours_needed.is_empty() {
+            self.fetch_state.lock().unwrap().status = format!("{} — all hours cached!", label);
+            return;
+        }
+
+        let progress = Arc::clone(&self.preload_progress);
+        progress.completed.store(0, Ordering::Relaxed);
+        progress.total.store(hours_needed.len() as u32, Ordering::Relaxed);
+        progress.active.store(true, Ordering::Relaxed);
+        progress.errors.lock().unwrap().clear();
+        *progress.label.lock().unwrap() = label;
+
+        let run = self.run_mode.clone();
+        let width = self.render_width;
+        let height = self.render_height;
+        let composite_name = self.selected_composite.clone();
+        let selected_field = self.selected_field;
+        let prefetch_incoming = Arc::clone(&self.prefetch_incoming);
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+
+            let dummy_state = Arc::new(Mutex::new(FetchState {
+                incoming: None, status: String::new(), fetching: false,
+            }));
+
+            hours_needed.par_iter().for_each(|&hour| {
+                let result = if let Some(ref comp_name) = composite_name {
+                    let comp_label = COMPOSITE_FIELDS.iter()
+                        .find(|c| c.name == comp_name.as_str())
+                        .map(|c| c.label).unwrap_or(comp_name.as_str()).to_string();
+                    fetch_and_render_composite(
+                        comp_name, &comp_label, &run, hour, width, height, &dummy_state, &ctx,
+                    )
+                } else {
+                    let field = FIELDS[selected_field].clone();
+                    fetch_and_render(&field, &run, hour, width, height, &dummy_state, &ctx)
+                };
+
+                match result {
+                    Ok((frame, _, _, _)) => {
+                        prefetch_incoming.lock().unwrap().push(IncomingFrame {
+                            frame, forecast_hour: hour,
+                            field_key: field_key.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        progress.errors.lock().unwrap().push(format!("f{:02}: {}", hour, e));
+                    }
+                }
+                progress.completed.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            });
+
+            progress.active.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Preload ALL fields × ALL forecast hours (0-48). The full matrix.
+    fn preload_all(&self, ctx: &egui::Context) {
+        if self.preload_progress.active.load(Ordering::Relaxed) { return; }
+
+        // Build list of all (field_key, comp_name, field_idx, fhour) jobs not yet cached
+        let mut jobs: Vec<(String, Option<String>, usize, u8)> = Vec::new();
+
+        for fhour in 0..=48u8 {
+            for (i, field) in FIELDS.iter().enumerate() {
+                let key = (field.name.to_string(), fhour);
+                if !self.frame_cache.contains_key(&key) {
+                    jobs.push((field.name.to_string(), None, i, fhour));
+                }
+            }
+            for comp in COMPOSITE_FIELDS.iter() {
+                let key = (comp.name.to_string(), fhour);
+                if !self.frame_cache.contains_key(&key) {
+                    jobs.push((comp.name.to_string(), Some(comp.name.to_string()), 0, fhour));
+                }
+            }
+        }
+
+        if jobs.is_empty() {
+            self.fetch_state.lock().unwrap().status = "Everything already cached!".to_string();
+            return;
+        }
+
+        let progress = Arc::clone(&self.preload_progress);
+        progress.completed.store(0, Ordering::Relaxed);
+        progress.total.store(jobs.len() as u32, Ordering::Relaxed);
+        progress.active.store(true, Ordering::Relaxed);
+        progress.errors.lock().unwrap().clear();
+        *progress.label.lock().unwrap() = format!("All fields × 49 hours ({})", jobs.len());
+
+        let run = self.run_mode.clone();
+        let width = self.render_width;
+        let height = self.render_height;
+        let prefetch_incoming = Arc::clone(&self.prefetch_incoming);
+        let ctx = ctx.clone();
+
+        std::thread::spawn(move || {
+            use rayon::prelude::*;
+
+            let dummy_state = Arc::new(Mutex::new(FetchState {
+                incoming: None, status: String::new(), fetching: false,
+            }));
+
+            jobs.par_iter().for_each(|(field_key, comp_name, field_idx, fhour)| {
+                let result = if let Some(ref comp) = comp_name {
+                    let comp_label = COMPOSITE_FIELDS.iter()
+                        .find(|c| c.name == comp.as_str())
+                        .map(|c| c.label).unwrap_or(comp.as_str()).to_string();
+                    fetch_and_render_composite(
+                        comp, &comp_label, &run, *fhour, width, height, &dummy_state, &ctx,
+                    )
+                } else {
+                    let field = FIELDS[*field_idx].clone();
+                    fetch_and_render(&field, &run, *fhour, width, height, &dummy_state, &ctx)
+                };
+
+                match result {
+                    Ok((frame, _, _, _)) => {
+                        prefetch_incoming.lock().unwrap().push(IncomingFrame {
+                            frame, forecast_hour: *fhour,
+                            field_key: field_key.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        progress.errors.lock().unwrap().push(format!("{} f{:02}: {}", field_key, fhour, e));
+                    }
+                }
+                progress.completed.fetch_add(1, Ordering::Relaxed);
+                ctx.request_repaint();
+            });
+
+            progress.active.store(false, Ordering::Relaxed);
+            ctx.request_repaint();
+        });
+    }
+
     fn export_gif(&mut self, ctx: &egui::Context) {
         if self.exporting_gif { return; }
         self.exporting_gif = true;
@@ -453,7 +662,7 @@ fn fetch_and_render(
     height: u32,
     state: &Arc<Mutex<FetchState>>,
     ctx: &egui::Context,
-) -> Result<(CachedFrame, String, u8, f64), String> {
+) -> Result<(FetchedFrame, String, u8, f64), String> {
     let t0 = Instant::now();
 
     let (date, run_hour) = hrrr_render::fetch::parse_run(run)
@@ -497,7 +706,7 @@ fn fetch_and_render(
     let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let flat: Vec<u8> = pixel_buf.iter().flat_map(|c| c.iter().copied()).collect();
 
-    Ok((CachedFrame {
+    Ok((FetchedFrame {
         pixels: flat,
         width: img_width,
         height: img_height,
@@ -517,7 +726,7 @@ fn fetch_and_render_composite(
     height: u32,
     state: &Arc<Mutex<FetchState>>,
     ctx: &egui::Context,
-) -> Result<(CachedFrame, String, u8, f64), String> {
+) -> Result<(FetchedFrame, String, u8, f64), String> {
     let t0 = Instant::now();
 
     let (date, run_hour) = hrrr_render::fetch::parse_run(run)
@@ -579,7 +788,7 @@ fn fetch_and_render_composite(
     let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let flat: Vec<u8> = pixel_buf.iter().flat_map(|c| c.iter().copied()).collect();
 
-    Ok((CachedFrame {
+    Ok((FetchedFrame {
         pixels: flat,
         width: img_width,
         height: img_height,
@@ -590,6 +799,13 @@ fn fetch_and_render_composite(
 }
 
 /// Export animation frames to GIF.
+/// A decompressed frame for GIF encoding.
+struct GifFrame {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 fn do_gif_export(
     field: &hrrr_render::fields::FieldDef,
     composite_name: Option<&str>,
@@ -610,7 +826,7 @@ fn do_gif_export(
         chrono::Utc::now().format("%Y%m%d_%H%M%S"));
 
     // Collect all frames
-    let mut frames: Vec<CachedFrame> = Vec::new();
+    let mut frames: Vec<GifFrame> = Vec::new();
     let dummy_state = Arc::new(Mutex::new(FetchState {
         incoming: None,
         status: String::new(),
@@ -624,23 +840,27 @@ fn do_gif_export(
         }
         ctx.request_repaint();
 
-        let frame = if let Some(cached) = existing_cache.get(&fhour) {
-            cached.clone()
+        let gif_frame = if let Some(cached) = existing_cache.get(&fhour) {
+            GifFrame {
+                pixels: cached.decompress(),
+                width: cached.width,
+                height: cached.height,
+            }
         } else if let Some(comp) = composite_name {
             let comp_label = COMPOSITE_FIELDS.iter()
                 .find(|c| c.name == comp)
                 .map(|c| c.label).unwrap_or(comp);
-            let (frame, _, _, _) = fetch_and_render_composite(
+            let (fetched, _, _, _) = fetch_and_render_composite(
                 comp, comp_label, run, fhour, width, height, &dummy_state, ctx,
             )?;
-            frame
+            GifFrame { pixels: fetched.pixels, width: fetched.width, height: fetched.height }
         } else {
-            let (frame, _, _, _) = fetch_and_render(
+            let (fetched, _, _, _) = fetch_and_render(
                 field, run, fhour, width, height, &dummy_state, ctx,
             )?;
-            frame
+            GifFrame { pixels: fetched.pixels, width: fetched.width, height: fetched.height }
         };
-        frames.push(frame);
+        frames.push(gif_frame);
     }
 
     // Encode GIF
@@ -692,24 +912,80 @@ impl eframe::App for HrrrApp {
             self.start_fetch(ctx);
         }
 
+        // ── Keyboard navigation ──────────────────────────────────────
+        let fetching_now = self.fetch_state.lock().unwrap().fetching;
+        {
+            let keys = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::ArrowRight),
+                )
+            });
+            let (up, down, left, right) = keys;
+
+            // Up/Down: navigate field list
+            if (up || down) && !fetching_now {
+                // Build ordered list of all field keys matching sidebar order
+                let mut all_keys: Vec<(String, Option<String>, usize)> = Vec::new();
+                for group in field_groups() {
+                    for field in fields_in_group(group) {
+                        let idx = FIELDS.iter().position(|f| f.name == field.name).unwrap_or(0);
+                        all_keys.push((field.name.to_string(), None, idx));
+                    }
+                }
+                for comp in COMPOSITE_FIELDS.iter() {
+                    all_keys.push((comp.name.to_string(), Some(comp.name.to_string()), 0));
+                }
+
+                // Find current position
+                let current_key = self.current_field_key();
+                let pos = all_keys.iter().position(|(k, _, _)| k == &current_key).unwrap_or(0);
+
+                let new_pos = if up {
+                    if pos > 0 { pos - 1 } else { all_keys.len() - 1 }
+                } else {
+                    if pos + 1 < all_keys.len() { pos + 1 } else { 0 }
+                };
+
+                let (_, comp, idx) = &all_keys[new_pos];
+                self.selected_composite = comp.clone();
+                if comp.is_none() {
+                    self.selected_field = *idx;
+                }
+                self.start_fetch(ctx);
+            }
+
+            // Left/Right: navigate forecast hours
+            if left && !fetching_now && !self.animating && self.forecast_hour > 0 {
+                self.forecast_hour -= 1;
+                self.start_fetch(ctx);
+            }
+            if right && !fetching_now && !self.animating && self.forecast_hour < 48 {
+                self.forecast_hour += 1;
+                self.start_fetch(ctx);
+            }
+        }
+
         // Receive rendered frames and cache them
         let incoming_frame = self.fetch_state.lock().unwrap().incoming.take();
         if let Some(incoming) = incoming_frame {
             let fhour = incoming.forecast_hour;
-            let frame = incoming.frame;
+            let fetched = incoming.frame;
 
-            // Update texture
+            // Update texture from uncompressed pixels
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [frame.width as usize, frame.height as usize],
-                &frame.pixels,
+                [fetched.width as usize, fetched.height as usize],
+                &fetched.pixels,
             );
             self.texture = Some(ctx.load_texture(
                 "hrrr_map", color_image, egui::TextureOptions::LINEAR,
             ));
-            self.tex_size = [frame.width, frame.height];
-            self.cached_values = Some(frame.values.clone());
-            self.cached_nx = frame.nx;
-            self.cached_ny = frame.ny;
+            self.tex_size = [fetched.width, fetched.height];
+            self.cached_values = Some(fetched.values);
+            self.cached_nx = fetched.nx;
+            self.cached_ny = fetched.ny;
             self.cached_field_idx = self.selected_field;
             self.cached_field_unit = if let Some(ref comp) = self.selected_composite {
                 COMPOSITE_FIELDS.iter()
@@ -719,11 +995,12 @@ impl eframe::App for HrrrApp {
             } else {
                 FIELDS[self.selected_field].unit.to_string()
             };
-            self.cached_img_width = frame.width;
+            self.cached_img_width = fetched.width;
 
-            // Store in cache with LRU eviction
+            // Compress and store in cache with LRU eviction
+            let cached = CachedFrame::compress(&fetched.pixels, fetched.width, fetched.height);
             let cache_key = (incoming.field_key, fhour);
-            self.cache_insert(cache_key, frame);
+            self.cache_insert(cache_key, cached);
 
             // Prefetch adjacent hours in background
             if !self.animating {
@@ -731,14 +1008,36 @@ impl eframe::App for HrrrApp {
             }
         }
 
-        // Drain prefetch queue into cache (don't update texture)
+        // Drain prefetch queue into cache (compress, don't update texture)
         {
             let prefetched: Vec<IncomingFrame> = self.prefetch_incoming.lock().unwrap().drain(..).collect();
             for pf in prefetched {
                 let key = (pf.field_key, pf.forecast_hour);
                 if !self.frame_cache.contains_key(&key) {
-                    self.cache_insert(key, pf.frame);
+                    let cached = CachedFrame::compress(
+                        &pf.frame.pixels, pf.frame.width, pf.frame.height,
+                    );
+                    self.cache_insert(key, cached);
                 }
+            }
+        }
+
+        // Show preload completion summary
+        if !self.preload_progress.active.load(Ordering::Relaxed) {
+            let total = self.preload_progress.total.load(Ordering::Relaxed);
+            let completed = self.preload_progress.completed.load(Ordering::Relaxed);
+            if total > 0 && completed == total {
+                let errors = self.preload_progress.errors.lock().unwrap();
+                let label = self.preload_progress.label.lock().unwrap().clone();
+                if errors.is_empty() {
+                    self.fetch_state.lock().unwrap().status =
+                        format!("{} — preloaded {} frames", label, total);
+                } else {
+                    self.fetch_state.lock().unwrap().status =
+                        format!("{} — {} ok, {} errors", label, total - errors.len() as u32, errors.len());
+                }
+                // Reset so we don't keep overwriting status
+                self.preload_progress.total.store(0, Ordering::Relaxed);
             }
         }
 
@@ -815,7 +1114,6 @@ impl eframe::App for HrrrApp {
 
                             let response = ui.add(btn);
                             if response.clicked() && !fetching {
-                                self.animating = false;
                                 self.selected_field = idx;
                                 self.selected_composite = None;
                                 self.start_fetch(ctx);
@@ -851,7 +1149,6 @@ impl eframe::App for HrrrApp {
 
                         let response = ui.add(btn);
                         if response.clicked() && !fetching {
-                            self.animating = false;
                             self.selected_composite = Some(comp.name.to_string());
                             self.start_fetch(ctx);
                         }
@@ -1017,6 +1314,34 @@ impl eframe::App for HrrrApp {
                         ui.label(egui::RichText::new(
                             format!("{}/{} cached", cached_count, self.cache_max_frames)
                         ).color(text_dim).size(10.0));
+                    }
+
+                    ui.separator();
+
+                    // Preload buttons / progress
+                    let preloading = self.preload_progress.active.load(Ordering::Relaxed);
+                    if preloading {
+                        let done = self.preload_progress.completed.load(Ordering::Relaxed);
+                        let total = self.preload_progress.total.load(Ordering::Relaxed);
+                        let label = self.preload_progress.label.lock().unwrap().clone();
+                        ui.label(egui::RichText::new(
+                            format!("Preloading {} {}/{}...", label, done, total)
+                        ).color(accent).size(11.0));
+                    } else {
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Preload Hours").size(10.0))
+                            .min_size(egui::vec2(0.0, 20.0))
+                        ).on_hover_text("Download all 49 forecast hours for current field")
+                         .clicked() {
+                            self.preload_product(ctx);
+                        }
+                        if ui.add(egui::Button::new(
+                            egui::RichText::new("Preload All").size(10.0))
+                            .min_size(egui::vec2(0.0, 20.0))
+                        ).on_hover_text("Download ALL fields × ALL hours (full preload)")
+                         .clicked() {
+                            self.preload_all(ctx);
+                        }
                     }
                 });
             });
